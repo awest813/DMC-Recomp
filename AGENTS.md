@@ -1,162 +1,88 @@
-# Agent Instructions - PS2 Web Recomp (Devil May Cry target)
+# Agent Instructions - PS2 Web Recomp (Devil May Cry)
 
-This file is for coding agents working in this workspace. Read `HANDOFF.md`, `ENGINEERING_LOG.md`, and `PROGRESS_PLAN.md` first.
+For coding agents working in this repository. Read `HANDOFF.md` first (status, build, test, open issues); `ENGINEERING_LOG.md` has the history behind each fix.
 
 ## Mission
 
-Port Devil May Cry (`SLUS_202.16`) to the web using this static-recompilation runtime.
-
-Current milestone: native boot -> Mission 1 gameplay works, and the web build runs at 60 fps through the intro FMV. Web Mission 1 is verified at ~60 fps, and the native window works with SDL2. Next: memory card save/load, the FMV-start hitch on the web, and playing further into the game.
+Port Devil May Cry (`SLUS_202.16`) to the browser through this static-recompilation runtime, fixing the generic runtime rather than adding game-specific code. It currently plays natively and on the web from boot into Mission 1; see `HANDOFF.md` > Open issues for what is next.
 
 ## Ground rules
 
-- Do not hand-edit generated code in `generated/dmc`. Fix the recompiler/runtime or regenerate it.
-- Do not commit the ISO, generated C++, screenshots, save states, or other game data.
-- Do not commit at all unless the user explicitly asks.
-- Keep the existing code style. Do not add comments unless they explain non-obvious hardware/runtime behavior.
-- Prefer the Windows native build. WSL is not required and is not currently usable for builds.
-- Do not publish generated code or binaries; they are translations of the game executable.
+- Never hand-edit `generated/dmc`. Fix the recompiler or runtime and regenerate.
+- Never commit or publish game data: the ISO, generated C++, built binaries, save states, screenshots, golden frames, audio dumps, or anything under `games/`. `.gitignore` covers these; check `git status` before committing.
+- Commit only when the user asks. Work on `dmc-port` (or a branch from it), not `main`.
+- Third-party binaries (`third_party/wgpu-native`, `third_party/SDL2-*`, `tools/emsdk`) stay uncommitted. Ask the user before downloading anything new.
+- Keep the existing code style. Comment only non-obvious hardware or runtime behavior.
+- Run `python scripts/dmc_regress.py` after runtime changes; refresh golden frames (`--record`) only for intended output changes, and say so.
+- Validate SIF/CD/kernel fixes from a fresh boot as well as from save states; old states can hold stale IOP requests.
 
 ## Environment
 
-- OS: Windows, PowerShell 5.1.
-- Compiler: `clang++` 22.1.8, target `x86_64-w64-windows-gnu`.
-- CMake: 3.31.12.
-- Ninja: 1.13.2.
-- ISO: `..\Devil May Cry.iso` from the repository root.
-- Extracted boot ELF: `C:\Users\allen\AppData\Local\Temp\dmc-audit\SLUS_202.16`.
-- The workspace is not a Git repository. Use the filesystem state as the source of truth.
+- Windows 11, PowerShell 5.1 and Git Bash. `clang++` 22.1.8 (`x86_64-w64-windows-gnu`), CMake 3.31.12, Ninja 1.13.2, Python 3.14 (Pillow, numpy), Node 26.
+- GPU: Intel Arc A750. WSL is not usable for builds and is not needed.
+- ISO: `..\Devil May Cry.iso` from the repository root. Boot ELF: `C:\Users\allen\AppData\Local\Temp\dmc-audit\SLUS_202.16` (also copied to `games/dmc/disc/`).
+- Windows Defender has quarantined `tools/emsdk/upstream/bin/wasm-opt.exe` once (a false positive). Do not change security settings; ask the user to restore it.
+- Shell gotchas: Git Bash heredocs feeding Python can turn `\n` inside string literals into real newlines; write such scripts to a file. PowerShell variables are case-insensitive (`$game` and `$Game` are the same variable). Windows filenames cannot contain `:`.
 
-## Build
+## Runner basics
 
-Run from the repository root.
+`build/native-dmc/ps2run.exe <elf> --disc <iso> --memcard <card.ps2> [options]`
 
-```powershell
-cmake -S . -B build/tools -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++
-ninja -C build/tools eerecomp vurecomp
+- `--frames N` halts at frame N. `--press frame:button[+button][:frames]` scripts input; buttons: `cross circle square triangle start select up down left right l1 r1 l2 r2 l3 r3` and stick directions `lup ldown lleft lright`.
+- `--frames-dir dir --frame-every n` dumps PPM frames (the directory must exist). `--misses file` writes unresolved guest addresses; check it after exploratory runs.
+- `--save-state N:file` saves at frame N; it is checked after the frame-limit halt, so use `--frames N+1`. `--load-state file` resumes; frame numbers stay absolute.
+- `--window` / `--fullscreen` (SDL build), `--widescreen`, `--trace-syscalls`, `--trace-threads`, `--trace-iop` (very large), `--trace-iop-hle`.
+- Boot inputs that reach the title and start a new game: `--press 300:start --press 600:cross --press 660:cross --press 720:cross --press 780:cross --press 840:cross --press 900:cross` (`scripts/dmc_run.sh <frames> <log>` adds Start/Cross presses after that).
 
-cmake -S . -B build/native-dmc -G Ninja -DCMAKE_BUILD_TYPE=Release `
-  -DCMAKE_CXX_COMPILER=clang++ `
-  "-DPS2_GENERATED=$((Get-Location).Path)/generated/dmc"
-ninja -C build/native-dmc ps2run
-```
+## Debugging reference
 
-Regenerate DMC only when the recompiler or entry list changes:
+Environment variables (native unless noted):
 
-```powershell
-& 'build/tools/eerecomp.exe' 'C:\Users\allen\AppData\Local\Temp\dmc-audit\SLUS_202.16' `
-  --entries 'generated/dmc/entries.txt' --out 'generated/dmc'
-```
+| Variable | Effect |
+|---|---|
+| `PS2_GS=gpu\|both\|soft` | Renderer: GPU (default), GPU plus software mirror, or software only. |
+| `PS2_GS_COMPARE=1\|show` | With `both`: report GPU vs software pixel differences per dumped frame; `show` dumps the GPU image. |
+| `PS2_SCALE=1\|2\|3` | Internal resolution. |
+| `PS2_ONE_THREAD=1`, `PS2_NO_VU_THREAD=1` | Window build: disable the threaded pipeline or just the VU thread. |
+| `PS2_FRAMES_ONLY=f1,f2` | Limit `--frames-dir` dumps to those frames. |
+| `PS2_DUMP=file` | EE RAM at halt (36 MiB). |
+| `PS2_DUMP_VRAM=bp,bw,psm,w,h,file;...` | GS memory regions at halt. |
+| `PS2_DUMP_AUDIO=file.wav` | SPU2 output for the run. |
+| `PS2_PEEK_FRAME=addr,n` | Every vblank: n words at addr, printed as floats (`[peek]`). |
+| `PS2_PEEK_WORDS=a,b,...` | Every vblank: those words in hex (`[peekw]`). |
+| `PS2_WATCH=base,len` | Print every write into that RAM range with PC/RA. |
+| `PS2_TRACE_DISPLAY=1` | Display registers and sample pixels per dumped frame. |
+| `PS2_TRACE_PRIM=N\|fN` | Primitive setup from primitive N, or for all of frame N. Filters: `PS2_TRACE_PRIM_BP=<hex block>` (frame or texture base), `PS2_TRACE_PRIM_TYPE=<0-6>`. Software renderer. |
+| `PS2_TRACE_TEXSUM=N` | Unique texture/target setups drawn in frame N with counts and screen boxes (software renderer). |
+| `PS2_TRACE_PIXEL=x,y` | Every fragment at one pixel: texture, uv, color, blend, destination, depth/alpha tests (software renderer; GS coordinates, so halve Y for 448-line interlaced output). |
+| `PS2_SKIP_TBP=<hex>` | Skip textured draws from that texture base (software renderer). |
+| `PS2_TRACE_INTC=1`, `PS2_TRACE_DMA=1`, `PS2_TRACE_MC=1`, `PS2_TRACE_SPU2=1`, `PS2_TRACE_IPU=1` | Interrupt handlers, DMA, memory card, SPU2, IPU logging. |
+| `PS2_SPIKES=ms`, `PS2_TIME=from,count` | Frames slower than ms; average frame time over a range. |
+| `PS2_VU_RECORD=dir` | Record VU1 microprograms for `vurecomp`. |
+| `PS2_VU_CAPTURE=file:skip:count`, `PS2_THREAD_PROFILE=file` | VU1 call capture for `recomp/vubench.cpp`; native thread sampler for `scripts/thread_profile.py`. |
+| `PS2_PROBE_COUNT=from,to`, `PS2_PROBE_ONLY=<hex pc>` | Probe build only: count hits per probe in a frame window, or print one probe's registers. |
+| `PS2_KEYS=controls.txt`, `PS2_QUICKSAVE=file`, `PS2_QUICKSAVE_AT=frame` | Window build: key layout, F5 target, and a test trigger for F5. |
 
-Expected result: 253 code units, 256 files in `generated/dmc`, about 65.8 MB.
+Probe build: list addresses (e.g. every `T`/`t` symbol from `llvm-nm`), run `eerecomp ... --probes list --out generated/dmc-probe`, build it into its own directory, then use `PS2_PROBE_COUNT` and `python scripts/probediff.py a.log b.log` (symbols from `llvm-nm -n <elf> > games/dmc/syms.txt`) to diff which game functions run.
 
-## Run and observe
+Web page URL parameters: `state=<file in build/web-dmc>`, `press=frame:button,...`, `keys=input:Key,Key;...`, `PS2_SCALE=1..3`, `aspect=16:9`, `tracedisc` (log slow disc chunks), `nocard`, `gpu=low`.
 
-Minimum boot-to-title run:
+## DMC memory map (NTSC-U)
 
-```powershell
-& 'build/native-dmc/ps2run.exe' 'C:\Users\allen\AppData\Local\Temp\dmc-audit\SLUS_202.16' `
-  --disc '..\Devil May Cry.iso' `
-  --memcard 'games/dmc/explore.ps2' `
-  --frames 1200 `
-  --press 300:start `
-  --press 600:cross --press 660:cross --press 720:cross `
-  --press 780:cross --press 840:cross --press 900:cross
-```
+| Address | Meaning |
+|---|---|
+| `0x5B71B0` | Player work struct; position at `+0x110` (x, y, z floats), so `PS2_PEEK_FRAME=5B72C0,3`. Gravity is -Y. |
+| `0x754130` | Game flag word; `0x80000` set while enemies are active (shows the HUD). |
+| `0x9EE360` | `Gauge` (HUD) struct; bytes `+141/+142` show the vitality gauge. |
+| `0x5BEE18` | Vsync counter incremented by `Main_Get_Vsync`; `main` waits on it every frame (normal). |
 
-Important runner behavior:
+The ELF has symbols: `llvm-nm -n SLUS_202.16`. The 14 `t_*` overlay sections at `0x1F00000` are size 0; nothing to capture.
 
-- Start at frame 300 advances past the unformatted memory-card warning. Start at frame 30 does not.
-- `--frames-dir` requires the directory to already exist. Create it with `New-Item -ItemType Directory -Force`.
-- `--save-state frame:file` is checked after the frame-limit halt. Use `--frames 901` to save at frame 900.
-- `PS2_DUMP=<path>` writes EE RAM at halt (36 MiB / 37,748,736 bytes).
-- `--misses <path>` writes unresolved guest addresses. Check this file after every exploratory run.
-- `--trace-iop` is very large. Use it only for short, targeted runs and filter the log.
+## Known false leads
 
-Check results:
-
-```powershell
-Get-Content 'games/dmc/run.log' | Select-Object -Last 20
-Test-Path 'games/dmc/misses.txt'
-```
-
-Screenshots are PPM. Convert with Pillow when inspecting:
-
-```powershell
-python -c "from PIL import Image; import glob; [Image.open(p).save(p[:-4]+'.png') for p in glob.glob('games/dmc/shots/*.ppm')]"
-```
-
-## Debugging
-
-### Native crash
-
-The native runner has a Windows unhandled-exception handler in `host/main.cpp`. It prints:
-
-```text
-[crash] code ... off ... pc ... ra ... frame ...
-```
-
-Use the guest PC/RA to find the generated unit or runtime function. The previous crash was at guest PC `0x00201F48` in `ps2::kernel::handle_syscall`, caused by `SleepThread` dereferencing a null `current()`.
-
-### Black screen / display
-
-`runtime/src/system.cpp` supports optional display tracing:
-
-```powershell
-$env:PS2_TRACE_DISPLAY = '1'
-```
-
-Use it with `--frames-dir` and `--frame-every`; the trace is emitted from `dump_frame()`.
-
-`PS2_DUMP_VRAM` writes regions at halt. It accepts `bp,bw,psm,w,h,path` specs separated by `;`:
-
-```powershell
-$env:PS2_DUMP_VRAM='0,8,0,512,448,games/dmc/fb0.ppm;700,8,0,512,448,games/dmc/fb1.ppm'
-```
-
-`PS2_TRACE_PRIM=<start>` logs primitive setup, TEX0 fields, scissor, and vertices. Use a high start counter to skip boot; otherwise the log is very large.
-
-### Save states
-
-Save states are useful for fast reproduction, but they can contain stale SIF held calls created before a runtime fix. If a fix changes SIF/CD behavior, validate on a fresh boot before trusting a saved state.
-
-### Known false leads
-
-- `ioman` #20/#21 are registered stubs returning `-1`; they are not missing.
-- A `secrman` version mismatch does not affect HLE lookup. HLE is keyed by library name and function index; the version map only checks existence.
-- `cdvdman` #51 is still absent, but it is not the current blocker.
-- `[iop-tty] SPU:T/O` and the SIF "waiting for reply" logs appeared during boot but did not prevent reaching the title.
-- The WSL toolchain failure is irrelevant to the working Windows native path.
-
-## Current priority
-
-1. Verify gameplay in the browser (`scripts/build_web.ps1 dmc`, `scripts/serve.py ... --record games/dmc/vu1-web`).
-2. Keep VU1 programs AOT-compiled: record with `PS2_VU_RECORD=games/dmc/vu1`, then `vurecomp games/dmc/vu1 generated/dmc`, then re-run the CMake configure. An interpreted VU1 costs ~7x in gameplay.
-3. Native window needs SDL2. Without it, `ps2run` is headless and single-threaded.
-
-### Fixed false lead
-
-The `main` wait on `[0x5BEE18]` is the normal per-frame vsync wait; `Main_Get_Vsync` increments it every vblank. The real black-screen bug was a zombie thread after `ExitDeleteThread` (fixed in `kernel.cpp` `switch_to`).
-
-## Definition of done for the current milestone
-
-- Done natively: boot -> title -> FMV -> cutscene -> Mission 1, from a fresh boot, with no crash, unhandled syscall or missing code.
-- `0x1F00000` overlay sections are size 0; nothing to capture.
-- Remaining: the same path in the browser; memory card save/load.
-
-## Key files
-
-- `HANDOFF.md` - current state and commands.
-- `launcher/launcher.ps1` - Windows launcher (`Play Devil May Cry.bat`).
-- `ENGINEERING_LOG.md` - chronological findings and evidence.
-- `PROGRESS_PLAN.md` - phased plan and acceptance criteria.
-- `scripts/windows.py` - overlay windows and capture.
-- `runtime/src/kernel.cpp` - EE kernel HLE.
-- `runtime/src/iop/sif.cpp` - SIF RPC and held calls.
-- `runtime/src/iop/cdvdfsv.cpp` - CD/DVD SIF servers.
-- `runtime/src/ipu/ipu.cpp` - IPU decode.
-- `runtime/src/gs/gs.cpp` - GS memory/display/image transfers.
-- `runtime/src/gs/raster.cpp` - software rasterizer.
-- `host/main.cpp` - native runner/crash handler.
-- `runtime/src/system.cpp` - frame loop/screenshots/display trace.
-- `generated/dmc/` - generated code; do not edit.
+- `main` spinning at `0x15B4D8` is its normal per-frame vsync wait.
+- `ioman` #20/#21 are registered stubs returning -1; `cdvdman` #51 is absent but unused on the tested path.
+- The `secrman` version mismatch does not affect HLE lookup (keyed by library name and index).
+- `[iop-tty] SPU:T/O` and SIF "waiting for reply" messages at boot are harmless.
+- The bridge door in the prologue and the red door in the castle hall do not open: the route goes down the cliff path, and the red door is sealed by the story.
+- The HUD gauge is hidden while exploring by design (`Life_gauge_move`).

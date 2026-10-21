@@ -1,8 +1,26 @@
-# Engineering Log - Devil May Cry Web Port
+# Engineering Log - Devil May Cry Port
 
-Target: `SLUS_202.16` / `Devil May Cry.iso`
+Target: `SLUS_202.16` / `Devil May Cry.iso`. Chronological record of findings, evidence and fixes; entries are not rewritten later, so early sections describe what was believed at the time. Current status and commands are in `HANDOFF.md`.
 
-Workspace: `C:\Users\allen\Downloads\ps2-web-recomp-main\ps2-web-recomp-main`
+## Index
+
+| Topic | Section |
+|---|---|
+| Audit, toolchain, overlay windows | 2026-10-19 - Initial audit and native bring-up |
+| Crash at frame 950 (`SleepThread`) | Crash at frame 950 |
+| CD sync call held forever | `cdvdfsv` sync hang |
+| Black screen after the title (root cause: zombie thread) | Black screen after title (investigation) and 2026-10-19 (session 2) |
+| GPU renderer, AOT VU1, performance table | 2026-10-19 (session 2) > Performance |
+| Ground/sea texture noise (scratchpad DMA interleave) | 2026-10-19 (session 2) > Fixed: ground/sea texture noise |
+| Falling through the floor (VU0 macro flags) | 2026-10-19 (session 2, later) - Falling through the floor |
+| Native window, SDL2, HWND surface | 2026-10-20 - Native window on Windows |
+| Web stalls, dev server, keyboard stick, GPU stat | 2026-10-20 - Web stalls, keyboard movement, GPU stats |
+| VU1 thread speed on the web | 2026-10-20 - VU1 thread saturation on the web |
+| Launcher, key remapping, controller layout, HUD | 2026-10-20 - Launcher, controls, HUD check |
+| Regression suite, explorer, software renderer speckles | 2026-10-21 - Regression suite and explorer |
+| No-WebGPU crash, doors | 2026-10-21 - Browser without WebGPU, door checks |
+| F5 quick-save | 2026-10-21 - Quick-save in the native window |
+| Audio check, memory card behavior | 2026-10-21 - Audio check, memory card behavior |
 
 ## 2026-10-19 - Initial audit and native bring-up
 
@@ -293,6 +311,8 @@ A 1300-frame `--trace-iop-hle` run shows no `cdvdfsv` or `fileio` activity after
 
 ### Working hypotheses
 
+> Superseded: none of these was the cause. The wait in `main` is normal; the black screen came from a zombie thread after `ExitDeleteThread`. See 2026-10-19 (session 2).
+
 1. A counter used by `main` is supposed to be advanced by a vsync/field callback, movie thread, or DMA completion that the runtime does not deliver after frame 950.
 2. The game is waiting for a movie/overlay thread (thread 2 / semaphore 0) that never receives its wakeup.
 3. A stage-load path is blocked without issuing a file read, or the read path is not logged.
@@ -316,7 +336,7 @@ Hypothesis 4 was previously strongest; the GS dump and primitive trace move the 
 - The WSL toolchain gap is real but irrelevant to the working Windows build.
 - The initial 344-file disc listing and the runtime's 354-file count differ; reconcile only if file lookup fails.
 
-## Current state
+## State at the end of session 1 (superseded)
 
 - Fixed: overlay window duplication, native `SleepThread` crash, `cdvdfsv` sync hold.
 - Working: native boot through title; screenshots; save states; 2400+ frame runs.
@@ -357,7 +377,7 @@ Result: the intro FMV, the real-time opening cutscene, Mallet Island, and Missio
 
 - `eerecomp --probes <file>` already emits `probe(c, pc)` at listed addresses.
 - `probe()` (`runtime/src/dispatch.cpp`) now has a counting mode: `PS2_PROBE_COUNT=<from>,<to>` counts hits per probe between those frames and prints `[probe] 0xADDR N` at exit.
-- Recipe: `llvm-nm -n SLUS_202.16` -> list of `T/t` symbol addresses -> `eerecomp --probes ... --out generated/dmc-probe` -> separate `build/native-dmc-probe`. `games/dmc/probediff.py a.log b.log` diffs two windows with symbol names.
+- Recipe: `llvm-nm -n SLUS_202.16` -> list of `T/t` symbol addresses -> `eerecomp --probes ... --out generated/dmc-probe` -> separate `build/native-dmc-probe`. `scripts/probediff.py a.log b.log` diffs two windows with symbol names.
 
 ### Performance
 
@@ -414,6 +434,8 @@ Result: jumps land. A 1600-frame walk/jump/attack session stays on the ground. A
 
 ### Web build blocked by Windows Defender
 
+> Resolved 2026-10-20: the user restored `wasm-opt.exe`, and web builds work again. If it happens again, restore it the same way.
+
 At 21:51 Defender quarantined `tools/emsdk/upstream/bin/wasm-opt.exe` (threat ID 2147731250, almost certainly a false positive). Every web link now fails with "binaryen executable not found". The failed link also left a new unoptimized `build/web-dmc/ps2web.wasm` beside the older `ps2web.js`, so the served page is broken until a build succeeds. Restore the file from Defender's protection history (or reinstall emsdk 6.0.11 with an exclusion for `tools/emsdk`), then re-run `scripts/build_web.ps1 dmc`.
 
 ## 2026-10-20 - Native window on Windows
@@ -456,6 +478,8 @@ DMC only moves Dante with the left stick; the D-pad does nothing in gameplay (ch
 Mission 1 and the stabbing cutscene render cleanly at `PS2_SCALE=2` and `3`. The cutscene shows hard-edged rectangular fire patches on Dante's body at every scale, including 1x. They may be the burning blade (correct) or a missing mask; unconfirmed without a hardware reference.
 
 ### Next performance target
+
+> Resolved the same day: see 2026-10-20 - VU1 thread saturation on the web.
 
 In heavy Mission 1 scenes the browser's VU1 thread reaches 0% idle (all 26 recorded programs are AOT-compiled; nothing new was recorded), and those are the frames that dip to 43-50 fps. Profiling VIF unpack + VU1 on the VU thread is the next step.
 
@@ -515,7 +539,7 @@ The vitality gauge was not drawn in Mission 1 exploration (a full-frame trace: 2
 
 ### Open
 
-- The big door on the Mission 1 bridge does not open with Cross/examine or by walking into it; unclear whether that is the intended route. The cliff path below the bridge (left stick down) leads on.
+- The big door on the Mission 1 bridge does not open with Cross/examine or by walking into it; unclear whether that is the intended route. The cliff path below the bridge (left stick down) leads on. (Later: the bridge is a prologue; the route runs down the cliff path to the tower door, where Mission 1 starts.)
 - `PS2_TRACE_PRIM=f<frame>` now logs the whole frame (no 1000-prim cap); `PS2_TRACE_PRIM_TYPE=<n>` filters by primitive type.
 
 ## 2026-10-21 - Regression suite and explorer

@@ -48,6 +48,10 @@ It started with silence. The game's sound driver drives its tick from one of the
 
 Along the way it also needed a boot path like the BIOS gives, a module loaded from memory instead of the disc, and the scratchpad DMA's destination chain mode.
 
+## Devil May Cry on Windows (this branch)
+
+The `dmc-port` branch brings up Devil May Cry (NTSC-U, `SLUS_202.16`) and builds everything on Windows with clang, Ninja, wgpu-native, SDL2 and Emscripten. It plays from boot into Mission 1 natively and in the browser at 60 fps. Along the way it fixed several generic runtime bugs: a thread that kept running after `ExitDeleteThread`, VU0 macro-mode MAC flags, the scratchpad DMA interleave mode, and alpha-test speckles in the software renderer. It also adds a Windows launcher (`Play Devil May Cry.bat`), remappable keys and a regression suite. [HANDOFF.md](HANDOFF.md) has the status, build steps and open issues; [ENGINEERING_LOG.md](ENGINEERING_LOG.md) has how each problem was found.
+
 ## Port a game of your own
 
 You need git, CMake, Ninja, a C++20 compiler (clang is preferred and picked up automatically), Python 3, and 7-Zip if your disc image is in a `.7z`. Everything has been run on Linux on x86-64, and the scripts also build on macOS on Apple silicon, where the scripts need a newer bash than the system 3.2 (`brew install bash cmake ninja sevenzip`) and the native runner links wgpu-native against Metal. The first run installs the Emscripten SDK into `tools/emsdk`, or uses the one `EMSDK` points to, and downloads wgpu-native for the native runner. With `--native-only` the script skips the browser build and never installs the SDK; the native window then needs the SDL2 development files. Expect about 300 MB of disk space per game for the generated code and the builds; the disc image itself is linked, not copied.
