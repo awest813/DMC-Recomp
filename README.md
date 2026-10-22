@@ -4,7 +4,7 @@ PlayStation 2 games running in the browser through static recompilation. The gam
 
 This branch targets Devil May Cry, NTSC-U (`SLUS_202.16`), with native Windows and browser players. Start with [HANDOFF.md](HANDOFF.md) for setup and current limitations, [launcher/README.md](launcher/README.md) for the launcher, and [docs/NATIVE_STABILITY.md](docs/NATIVE_STABILITY.md) for native pacing and save/load checks. A locally supplied disc and generated game code are required; neither is included.
 
-The [GitHub Pages ISO picker](https://awest813.github.io/DMC-Recomp/) opens your local ISO and locally built browser files without a local server. See [browser setup](web/README.md#github-pages-iso-picker); an ISO alone cannot replace the required recompilation build.
+The [GitHub Pages ISO picker](https://awest813.github.io/DMC-Recomp/) includes the browser player: choose your Devil May Cry NTSC-U ISO and play without a local build or server. Your ISO stays on your computer. See [browser setup](web/README.md#github-pages-iso-picker).
 
 ## Upstream background
 

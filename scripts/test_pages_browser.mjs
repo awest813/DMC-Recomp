@@ -1,10 +1,10 @@
-// Real static hosting smoke test. All supplied game files remain local.
-// node scripts/test_pages_browser.mjs <picker-url> <disc.iso> <web-build-dir> [cdp-port]
+// Real static hosting smoke test. The supplied ISO remains local.
+// node scripts/test_pages_browser.mjs <picker-url> <disc.iso> [cdp-port]
 import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { writeFileSync } from 'node:fs';
-const [url, iso, build, port = '9333'] = process.argv.slice(2);
-if (!build) throw new Error('Supply picker URL, local ISO and browser build directory');
+const [url, iso, port = '9333'] = process.argv.slice(2);
+if (!iso) throw new Error('Supply picker URL and local ISO');
 const targets = await (await fetch(`http://127.0.0.1:${port}/json/list`)).json();
 const ws = new WebSocket(targets.find(t => t.type === 'page').webSocketDebuggerUrl);
 await new Promise(done => ws.addEventListener('open', done, { once: true }));
@@ -39,7 +39,7 @@ const pick = async (selector, paths) => {
 try {
   await send('Page.enable'); await send('Runtime.enable');
   await send('Page.navigate', { url });
-  await wait(`document.getElementById('status')?.textContent.includes('Choose your disc and browser build')`);
+  await wait(`document.getElementById('status')?.textContent.includes('Choose your disc to continue')`);
   assert.equal(await run('crossOriginIsolated'), true, 'Pages must work without server isolation headers');
   const shot = await send('Page.captureScreenshot', { format: 'png' });
   writeFileSync('build/pages-picker.png', Buffer.from(shot.data, 'base64'));
@@ -48,8 +48,7 @@ try {
   await send('Emulation.clearDeviceMetricsOverride');
   await pick('#iso', [iso]);
   await wait(`document.getElementById('iso-status').textContent.includes('SLUS_202.16')`);
-  assert.equal(await run(`document.getElementById('play').disabled`), true);
-  await pick('#runtime', ['ps2web.html', 'ps2web.js', 'ps2web.wasm', 'ps2web.data'].map(name => resolve(build, name)));
+  assert.equal(await run(`document.getElementById('runtime') === null`), true, 'Player files must be included');
   await wait(`!document.getElementById('play').disabled`);
   await run(`document.getElementById('play').click()`);
   await wait(`document.getElementById('game').contentWindow.Module?.discSize > 0 && !document.getElementById('game').contentDocument.getElementById('start').disabled`);

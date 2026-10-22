@@ -2,7 +2,7 @@ name: Deploy ISO picker to Pages
 on:
   push:
     branches: [dmc-port]
-    paths: ['web/pages/**', 'scripts/test_pages.mjs', '.github/workflows/pages.yml']
+    paths: ['web/pages/**', 'scripts/test_pages.mjs', 'scripts/package_pages.py', '.github/workflows/pages.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -25,10 +25,12 @@ jobs:
           node-version: '22'
       - name: Check local disc handling
         run: node scripts/test_pages.mjs
+      - name: Package launcher and verified browser player
+        run: python3 scripts/package_pages.py
       - uses: actions/configure-pages@v5
-      # Only these authored static files are published. No build output or game data.
+      # Only the launcher and four pinned player files. Never include an ISO or states.
       - uses: actions/upload-pages-artifact@v4
         with:
-          path: web/pages
+          path: build/pages
       - uses: actions/deploy-pages@v4
         id: deployment

@@ -1,18 +1,18 @@
-import { allowedNames, runtimeNames, inspectIso, fileReply } from './files.mjs';
+import { inspectIso, fileReply } from './files.mjs';
 const byId = id => document.getElementById(id);
 const files = new Map();
 let session = crypto.randomUUID(), ready = false, validating = false, selection = 0;
 const status = text => { byId('status').textContent = text; };
 const update = () => {
-  const complete = files.has('disc.iso') && runtimeNames.every(name => files.has(name));
+  const complete = files.has('disc.iso');
   byId('play').disabled = !ready || validating || !complete;
-  if (ready) status(validating ? 'Checking your disc…' : complete ? 'Ready. Your files stay on this device.' : 'Choose your disc and browser build to continue.');
+  if (ready) status(validating ? 'Checking your disc…' : complete ? 'Ready to play. Your ISO stays on this device.' : 'Choose your disc to continue.');
 };
 
 navigator.serviceWorker?.addEventListener('message', event => {
   const request = event.data, port = event.ports[0];
   if (!port || request?.type !== 'local-file') return;
-  const file = request.session === session && allowedNames.has(request.name) ? files.get(request.name) : null;
+  const file = request.session === session && request.name === 'disc.iso' ? files.get(request.name) : null;
   try { port.postMessage(file ? fileReply(file, request.name, request.method, request.range) : { missing: true }); }
   catch { port.postMessage({ missing: true }); }
   finally { port.close(); }
@@ -31,14 +31,6 @@ byId('iso').addEventListener('change', async event => {
     if (version !== selection) return;
     byId('iso-status').textContent = error.message;
   } finally { if (version === selection) { validating = false; update(); } }
-});
-
-byId('runtime').addEventListener('change', event => {
-  for (const name of allowedNames) if (name !== 'disc.iso') files.delete(name);
-  for (const file of event.target.files) if (allowedNames.has(file.name) && file.name !== 'disc.iso' && file.size) files.set(file.name, file);
-  const missing = runtimeNames.filter(name => !files.has(name));
-  byId('runtime-status').textContent = missing.length ? 'Still needed: ' + missing.join(', ') : 'Browser build selected · ' + (runtimeNames.reduce((n, name) => n + files.get(name).size, 0) / 1048576).toFixed(1) + ' MB';
-  update();
 });
 
 byId('play').addEventListener('click', () => {
@@ -73,6 +65,8 @@ async function prepare() {
     location.reload(); return;
   }
   sessionStorage.removeItem('dmc-isolation-reload');
+  const checks = await Promise.all(['ps2web.html', 'ps2web.js', 'ps2web.wasm', 'ps2web.data'].map(name => fetch(new URL('runtime/' + name, location.href), { method: 'HEAD', cache: 'no-store' })));
+  if (checks.some(response => !response.ok || !(Number(response.headers.get('Content-Length')) > 0))) throw new Error('The browser player is unavailable. Reload in a moment to retry.');
   ready = true; update();
 }
 prepare().catch(error => status(error.message));

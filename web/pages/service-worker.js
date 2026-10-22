@@ -15,6 +15,10 @@ const isolate = response => {
 async function localFile(request, path) {
   const match = /^play\/([a-f0-9-]{36})\/(ps2web\.(?:html|js|wasm|data|worker\.js)|disc\.iso)$/.exec(path);
   if (!match) return new Response('Local file not found.', { status: 404 });
+  if (match[2] !== 'disc.iso') {
+    if (!['GET', 'HEAD'].includes(request.method)) return new Response(null, { status: 405, headers: { Allow: 'GET, HEAD' } });
+    return fetch(new URL('runtime/' + match[2], scope), { method: request.method });
+  }
   const clients = (await self.clients.matchAll({ type: 'window' })).filter(client => {
     const url = new URL(client.url);
     return url.origin === scope.origin && (url.pathname === scope.pathname || url.pathname === scope.pathname + 'index.html');

@@ -1,0 +1,22 @@
+{
+  "release": "browser-runtime-e36d8ac",
+  "source": "e36d8ac",
+  "files": {
+    "ps2web.html": {
+      "bytes": 42085,
+      "sha256": "3f5714e5571c3cd191188b874eccfe0fd75700e87a5cc0614c316e98d3a1c4c3"
+    },
+    "ps2web.js": {
+      "bytes": 153276,
+      "sha256": "c203f86f67f27c7d46b59e7b1749c7492d525be2aecd444e17e99ea9914f069c"
+    },
+    "ps2web.wasm": {
+      "bytes": 25136418,
+      "sha256": "3d9b90a1afb8c62736dba5bb99fb89d8ec13f4caeb783711d5d87e11157133f6"
+    },
+    "ps2web.data": {
+      "bytes": 6688482,
+      "sha256": "65be8a767f49e4f2add9845ab1ef14eb74c164a8ac9fc1eae9e56b51cdda5ab0"
+    }
+  }
+}

@@ -10,6 +10,7 @@ Port Devil May Cry (`SLUS_202.16`) to the browser through this static-recompilat
 
 - Never hand-edit `generated/dmc`. Fix the recompiler or runtime and regenerate.
 - Never commit or publish game data: the ISO, generated C++, built binaries, save states, screenshots, golden frames, audio dumps, or anything under `games/`. `.gitignore` covers these; check `git status` before committing.
+- User-authorized exception (2026-10-22): publish the four `ps2web.html/js/wasm/data` player artifacts as versioned GitHub release assets and bundle them in Pages so visitors select only an ISO. Keep these artifacts out of source commits. This exception does not include ISOs, generated C++, states or other game artifacts.
 - Commit only when the user asks. Work on `dmc-port` (or a branch from it), not `main`.
 - Third-party binaries (`third_party/wgpu-native`, `third_party/SDL2-*`, `tools/emsdk`) stay uncommitted. Ask the user before downloading anything new.
 - Keep the existing code style. Comment only non-obvious hardware or runtime behavior.

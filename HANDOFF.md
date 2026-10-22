@@ -31,7 +31,7 @@ Default keys: arrows or I/J/K/L move, S action/jump (Triangle), X sword (Circle)
 
 The native build (with `SDL2.dll` next to `ps2run.exe`) and the web build must exist first; see Build.
 
-GitHub Pages hosts a local ISO/build picker at https://awest813.github.io/DMC-Recomp/. Choose the supported disc and four locally built `ps2web` files; no game artifacts are hosted. Scoped service-worker isolation and bounded local range reads work without a local server. See [web/README.md](web/README.md#github-pages-iso-picker) for deployment and tests.
+GitHub Pages hosts an ISO picker with the browser player included at https://awest813.github.io/DMC-Recomp/. Choose the supported disc; no local build or server is needed. The four player files are versioned release assets bundled in Pages under the user's publication exception; ISO and other local game artifacts remain excluded. Scoped service-worker isolation and bounded local range reads keep the ISO on the visitor's computer. See [web/README.md](web/README.md#github-pages-iso-picker) for deployment and tests.
 
 ## Build
 
