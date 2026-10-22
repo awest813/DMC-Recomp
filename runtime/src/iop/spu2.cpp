@@ -291,6 +291,7 @@ void tick() {
     std::int16_t out[kBatch * 2];
     std::int32_t sum[2][kBatch][2] = {};
     std::int32_t wet[2][kBatch][2] = {};
+    std::int32_t input[2][kBatch][2] = {};
     std::int16_t rings[2][8][kBatch] = {};
     static const bool count = std::getenv("PS2_SPU2_COUNT") != nullptr;
     static std::uint64_t ticks = 0, active = 0, phases[5] = {};
@@ -317,21 +318,25 @@ void tick() {
         }
         std::int16_t unused[2];
         for (unsigned n = 0; n < kBatch; ++n)
-            render_input(c, sum[c][n][0], sum[c][n][1], c ? unused[0] : rings[0][0][n], c ? unused[1] : rings[0][1][n]);
+            render_input(c, input[c][n][0], input[c][n][1], c ? unused[0] : rings[0][0][n], c ? unused[1] : rings[0][1][n]);
     }
     for (unsigned n = 0; n < kBatch; ++n) {
-        std::int32_t mix[2] = {};
+        std::int32_t external[2] = {};
         for (int c = 0; c < 2; ++c) {
-            const std::int32_t l = sum[c][n][0] * master(g_cores[c].mvol[0]) >> 15, r = sum[c][n][1] * master(g_cores[c].mvol[1]) >> 15;
-            if (!c) {
-                rings[1][0][n] = clamp16(l);
-                rings[1][1][n] = clamp16(r);
+            const Core &core = g_cores[c];
+            const unsigned mmix = core.regs[0x198 / 2];
+            for (unsigned ch = 0; ch < 2; ++ch) {
+                std::int32_t dry = 0;
+                if (mmix & (0x800u >> ch)) dry += sum[c][n][ch];
+                if (mmix & (0x80u >> ch)) dry += input[c][n][ch];
+                if (c && (mmix & (0x8u >> ch))) dry += external[ch] * static_cast<std::int16_t>(core.avol[ch]) >> 15;
+                const auto sample = clamp16(clamp16(dry) * master(core.mvol[ch]) >> 15);
+                if (!c) {
+                    external[ch] = sample;
+                    rings[1][ch][n] = sample;
+                } else out[n * 2 + ch] = sample;
             }
-            mix[0] += l;
-            mix[1] += r;
         }
-        out[n * 2] = clamp16(mix[0]);
-        out[n * 2 + 1] = clamp16(mix[1]);
     }
     write_rings(0, rings[0]);
     write_rings(1, rings[1]);
@@ -528,6 +533,7 @@ void reset() {
     std::fill(g_ram.begin(), g_ram.end(), 0);
     for (Core &k : g_cores) {
         k = Core{};
+        k.regs[0x198 / 2] = &k == &g_cores[0] ? 0xFF0 : 0xFFC;
         for (unsigned reg : {0x188u, 0x18Cu, 0x190u, 0x194u}) {
             k.regs[reg / 2] = 0xFFFFu;
             k.regs[reg / 2 + 1] = 0xFFu;

@@ -40,6 +40,12 @@ void filter_tests() {
 
 std::vector<std::int16_t> captured;
 
+int core_output(unsigned core, int sample) {
+    int out = sample * 32766 >> 15;
+    if (core == 0) out = ((out * 32767) >> 15) * 32766 >> 15;
+    return out;
+}
+
 int source_sample(int index) {
     if (index < 0) return 0;
     index %= 112;
@@ -95,8 +101,8 @@ void voice_tests() {
                 for (int tap = 0; tap < 4; ++tap) taps[tap] = source_sample(index + tap - 3);
                 const int envelope = n == 0 ? 14336 : n == 1 ? 28672 : 32767;
                 const auto sample = (spu2::gaussian(taps, position & 4095) * envelope) >> 15;
-                const int left = ((sample * 32766) >> 15) * 32766 >> 15;
-                const int right = ((sample * 16384) >> 15) * 32766 >> 15;
+                const int left = core_output(core, sample * 32766 >> 15);
+                const int right = core_output(core, sample * 16384 >> 15);
                 char label[90];
                 std::snprintf(label, sizeof label, "core %u pitch %04X sample %u left", core, pitch, n);
                 expect(label, captured[n * 2], left);
@@ -171,7 +177,7 @@ void pcm_input_tests() {
         expect("PCM input sample count", captured.size(), 512);
         for (unsigned i = 0; i < captured.size() && i < 512; ++i) {
             const auto sample = inputs[i % 2][i / 2];
-            const auto expected = ((sample * 32767) >> 15) * 32766 >> 15;
+            const auto expected = core_output(core, sample * 32767 >> 15);
             expect("PCM input bypasses Gaussian filter", captured[i], expected);
         }
     }
@@ -272,7 +278,7 @@ void routing_tests() {
         spu2::write(core * 0x400 + 0x1CE, 0, 2);
         spu2::write(core * 0x400 + 0x1A0, 3, 2);
         advance(32);
-        expect("dry voice bus saturates before master gain", captured[40], (32767 * 32766) >> 15);
+        expect("dry voice bus saturates before master gain", captured[40], core_output(core, 32767));
         expect("wet voice bus saturates independently", static_cast<std::int16_t>(spu2::ram()[0x1400 + core * 0x800 + 52]), 32767);
         const auto raw_voice = static_cast<std::int16_t>(spu2::ram()[0x400 + core * 0x800 + 52]);
         expect("raw voice capture is independent of bus saturation", raw_voice > 0 && raw_voice < 32767, true);
@@ -282,11 +288,65 @@ void routing_tests() {
 
 }
 
+void mixer_tests() {
+    using namespace ps2::iop;
+    for (unsigned core : {0u, 1u}) {
+        configure(core, 0x1000);
+        advance(32);
+        const auto reference = captured;
+        for (unsigned mask : {0u, 0x800u, 0x400u, 0xC00u}) {
+            configure(core, 0x1000);
+            spu2::write(core * 0x400 + 0x198, mask, 2);
+            advance(32);
+            for (unsigned n = 0; n < 64; ++n)
+                expect("MMIX dry voice channel gates", captured[n], mask & (0x800u >> (n & 1)) ? reference[n] : 0);
+        }
+    }
+    for (unsigned mask : {0u, 8u, 4u, 12u})
+        for (int gain : {0, 16384, 32767, -16384}) {
+            configure(0, 0x1000);
+            spu2::write(0x598, mask, 2);
+            spu2::write(0x790, gain & 65535, 2);
+            spu2::write(0x792, gain & 65535, 2);
+            advance(32);
+            for (unsigned n = 0; n < 32; ++n)
+                for (unsigned ch = 0; ch < 2; ++ch) {
+                    const int ext = static_cast<std::int16_t>(spu2::ram()[0x800 + ch * 0x200 + 32 + n]);
+                    const int expected = mask & (8u >> ch) ? ((ext * gain) >> 15) * 32766 >> 15 : 0;
+                    expect("core zero external routing and signed gain", captured[n * 2 + ch], expected);
+                }
+        }
+    for (unsigned core : {0u, 1u})
+        for (unsigned mask : {0u, 0x80u, 0x40u, 0xC0u}) {
+            reset();
+            captured.clear();
+            spu2::set_sink([](const std::int16_t *samples, std::size_t frames) {
+                captured.insert(captured.end(), samples, samples + frames * 2);
+            });
+            for (unsigned n = 0; n < 256; ++n)
+                for (unsigned ch = 0; ch < 2; ++ch) {
+                    const std::int16_t sample = ch ? -12000 : 18000;
+                    std::memcpy(ram_ptr(0x1000 + ch * 512 + n * 2), &sample, 2);
+                }
+            spu2::write(core * 0x400 + 0x198, mask, 2);
+            spu2::write(core * 0x400 + 0x1B0, 1u << core, 2);
+            spu2::dma(core, 0x1000, 256, true, -1);
+            advance(32);
+            for (unsigned n = 0; n < 64; ++n) {
+                const unsigned ch = n & 1;
+                const int input = (ch ? -12000 : 18000) * 32767 >> 15;
+                expect("MMIX AutoDMA dry input gates", captured[n], mask & (0x80u >> ch) ? core_output(core, input) : 0);
+            }
+        }
+    spu2::set_sink({});
+}
+
 int main() {
     filter_tests();
     voice_tests();
     pcm_input_tests();
     routing_tests();
+    mixer_tests();
     std::printf("%d/%d SPU2 accuracy checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }

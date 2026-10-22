@@ -1,4 +1,5 @@
 #include "window.hpp"
+#include "pacing.hpp"
 
 #include "thread_profile.hpp"
 
@@ -20,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -81,12 +83,15 @@ void load_keys() {
     static const std::pair<const char *, std::uint16_t> kSticks[] = {{"lup", kStickUp},    {"ldown", kStickDown},    {"lleft", kStickLeft},    {"lright", kStickRight},
                                                                      {"rup", kRightUp},    {"rdown", kRightDown},    {"rleft", kRightLeft},    {"rright", kRightRight}};
     char line[256];
+    const auto trim = [](const std::string &text) {
+        const auto first = text.find_first_not_of(" \t\r\n"), last = text.find_last_not_of(" \t\r\n");
+        return first == std::string::npos ? std::string{} : text.substr(first, last - first + 1);
+    };
     while (std::fgets(line, sizeof line, f)) {
-        std::string text(line);
-        while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
+        const std::string text = trim(line);
         const auto eq = text.find('=');
         if (text.empty() || text[0] == '#' || eq == std::string::npos) continue;
-        const std::string name = text.substr(0, eq);
+        const std::string name = trim(text.substr(0, eq));
         std::vector<KeyBinding> *list = nullptr;
         std::uint16_t value = 0;
         for (const auto &[n, v] : kButtons) if (name == n) list = &g_keys, value = v;
@@ -95,16 +100,20 @@ void load_keys() {
             std::fprintf(stderr, "[keys] unknown input %s\n", name.c_str());
             continue;
         }
-        list->erase(std::remove_if(list->begin(), list->end(), [&](const KeyBinding &b) { return b.button == value; }), list->end());
+        std::vector<KeyBinding> replacements;
+        bool valid = true;
         for (std::size_t at = eq + 1; at <= text.size();) {
             const std::size_t comma = std::min(text.find(',', at), text.size());
-            const std::string key = text.substr(at, comma - at);
+            const std::string key = trim(text.substr(at, comma - at));
             at = comma + 1;
             if (key.empty()) continue;
             const SDL_Scancode code = scancode(key);
-            if (code == SDL_SCANCODE_UNKNOWN) std::fprintf(stderr, "[keys] unknown key %s\n", key.c_str());
-            else list->push_back({code, value});
+            if (code == SDL_SCANCODE_UNKNOWN) { std::fprintf(stderr, "[keys] unknown key %s; keeping previous mapping\n", key.c_str()); valid = false; }
+            else replacements.push_back({code, value});
         }
+        if (!valid) continue;
+        list->erase(std::remove_if(list->begin(), list->end(), [&](const KeyBinding &b) { return b.button == value; }), list->end());
+        list->insert(list->end(), replacements.begin(), replacements.end());
     }
     std::fclose(f);
 }
@@ -131,7 +140,16 @@ SDL_AudioDeviceID g_audio = 0;
 // the keyboard drives the first controller port along with the first game controller, a second one is player 2
 SDL_GameController *g_pads[2] = {};
 std::uint32_t g_tex_w = 0, g_tex_h = 0;
-double g_last = 0;
+native_host::FrameDeadline g_deadline;
+bool g_input_focused = true, g_threaded = false;
+std::atomic<bool> g_audio_failed{false};
+bool g_audio_started = false;
+double g_audio_average = 96.0;
+unsigned g_audio_fade = 240;
+unsigned g_audio_underruns = 0;
+std::atomic<int> g_save_status{0};
+std::mutex g_host_input_mutex;
+std::uint64_t g_host_pad[2] = {0xFFFF808080800000ull, 0xFFFF808080800000ull};
 std::vector<std::uint32_t> g_pixels;
 bool g_gpu_present = false;
 
@@ -182,9 +200,22 @@ bool attach_gpu() {
     return ps2::attach_window(target);
 }
 
-std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) {
-    const int v = SDL_GameControllerGetAxis(pad, a);
+std::uint8_t axis_value(int v) {
+    constexpr int deadzone = 4096;
+    if (std::abs(v) <= deadzone) return 0x80;
+    v = v < 0 ? (v + deadzone) * 32768 / (32768 - deadzone) : (v - deadzone) * 32767 / (32767 - deadzone);
     return static_cast<std::uint8_t>(std::clamp((v + 32768) >> 8, 0, 255));
+}
+
+std::uint8_t axis(SDL_GameController *pad, SDL_GameControllerAxis a) { return axis_value(SDL_GameControllerGetAxis(pad, a)); }
+
+void keyboard_input(const Uint8 *keys, std::uint16_t &pressed, std::uint8_t &lx, std::uint8_t &ly, std::uint8_t &rx, std::uint8_t &ry) {
+    for (const KeyBinding &b : g_keys) if (keys[b.key]) pressed |= b.button;
+    std::uint16_t stick = 0;
+    for (const KeyBinding &b : g_stick_keys) if (keys[b.key]) stick |= b.button;
+    const auto direction = [stick](unsigned low, unsigned high) { return static_cast<std::uint8_t>((stick & low) && !(stick & high) ? 0 : (stick & high) && !(stick & low) ? 255 : 128); };
+    lx = direction(kStickLeft, kStickRight); ly = direction(kStickUp, kStickDown);
+    rx = direction(kRightLeft, kRightRight); ry = direction(kRightUp, kRightDown);
 }
 
 void rumble(int port) {
@@ -193,7 +224,7 @@ void rumble(int port) {
     static Uint32 sent[2] = {};
     SDL_GameController *pad = g_pads[port];
     if (!pad) return;
-    const std::uint16_t motors = ps2::pad_rumble(port);
+    const std::uint16_t motors = g_input_focused ? ps2::pad_rumble(port) : 0;
     const double strong = (motors >> 8) < 16 ? 0.0 : std::sqrt((motors >> 8) / 255.0);
     const bool weak = motors & 1u;
     const Uint32 now = SDL_GetTicks();
@@ -216,6 +247,15 @@ void open_pad(int device) {
         }
 }
 
+void publish_input(int port, std::uint64_t state) {
+    const std::uint8_t axes[4] = {static_cast<std::uint8_t>(state >> 16), static_cast<std::uint8_t>(state >> 24), static_cast<std::uint8_t>(state >> 32), static_cast<std::uint8_t>(state >> 40)};
+    std::uint8_t pressure[16];
+    std::fill_n(pressure, 16, 0xFF);
+    pressure[8] = static_cast<std::uint8_t>(state >> 48);
+    pressure[9] = static_cast<std::uint8_t>(state >> 56);
+    ps2::set_pad_input(port, static_cast<std::uint16_t>(state), axes, pressure);
+}
+
 void poll_port(int port) {
     static bool plugged[2] = {};
     SDL_GameController *pad = g_pads[port];
@@ -226,23 +266,8 @@ void poll_port(int port) {
     std::uint16_t pressed = 0;
     std::uint8_t l2 = 0xFF, r2 = 0xFF;
     std::uint8_t lx = 0x80, ly = 0x80, rx = 0x80, ry = 0x80;
-    if (port == 0) {
-        const Uint8 *keys = SDL_GetKeyboardState(nullptr);
-        for (const KeyBinding &b : g_keys)
-            if (keys[b.key]) pressed |= b.button;
-        std::uint16_t stick = 0;
-        for (const KeyBinding &b : g_stick_keys)
-            if (keys[b.key]) stick |= b.button;
-        if (stick & kStickLeft) lx = 0x00;
-        if (stick & kStickRight) lx = 0xFF;
-        if (stick & kStickUp) ly = 0x00;
-        if (stick & kStickDown) ly = 0xFF;
-        if (stick & kRightLeft) rx = 0x00;
-        if (stick & kRightRight) rx = 0xFF;
-        if (stick & kRightUp) ry = 0x00;
-        if (stick & kRightDown) ry = 0xFF;
-    }
-    if (pad) {
+    if (port == 0 && g_input_focused) keyboard_input(SDL_GetKeyboardState(nullptr), pressed, lx, ly, rx, ry);
+    if (pad && g_input_focused) {
         for (const PadBinding &b : kPadButtons)
             if (SDL_GameControllerGetButton(pad, b.button)) pressed |= b.mask;
         const auto trigger = [&](SDL_GameControllerAxis a, std::uint16_t bit, std::uint8_t &pressure) {
@@ -259,18 +284,13 @@ void poll_port(int port) {
         if (ry == 0x80) ry = axis(pad, SDL_CONTROLLER_AXIS_RIGHTY);
     }
     rumble(port);
-    static std::uint64_t last[2] = {~0ull, ~0ull};
     const std::uint64_t state = pressed | (static_cast<std::uint64_t>(rx) << 16) | (static_cast<std::uint64_t>(ry) << 24) | (static_cast<std::uint64_t>(lx) << 32) |
                                 (static_cast<std::uint64_t>(ly) << 40) | (static_cast<std::uint64_t>(l2) << 48) | (static_cast<std::uint64_t>(r2) << 56);
-    if (state == last[port]) return;
-    last[port] = state;
-    ps2::set_pad_pressure(8, l2, port);
-    ps2::set_pad_pressure(9, r2, port);
-    ps2::set_pad_buttons(pressed, port);
-    ps2::set_pad_axis(0, rx, port);
-    ps2::set_pad_axis(1, ry, port);
-    ps2::set_pad_axis(2, lx, port);
-    ps2::set_pad_axis(3, ly, port);
+    {
+        std::lock_guard<std::mutex> lock(g_host_input_mutex);
+        g_host_pad[port] = state;
+        publish_input(port, state);
+    }
 }
 
 void poll() {
@@ -279,16 +299,27 @@ void poll() {
     if (quick_at && ps2::frames_run() >= quick_at) {
         quick_at = 0;
         const char *path = std::getenv("PS2_QUICKSAVE");
+        g_save_status.store(1);
         ps2::request_save_state(path ? path : "quicksave.ps2");
+    }
+    static Uint32 last_poll = 0;
+    if (g_threaded) {
+        const Uint32 now = SDL_GetTicks();
+        if (now - last_poll < 4) return;
+        last_poll = now;
     }
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) ps2::halt("window closed");
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F5 && !e.key.repeat) {
             const char *path = std::getenv("PS2_QUICKSAVE");
+            g_save_status.store(1);
             ps2::request_save_state(path ? path : "quicksave.ps2");
             SDL_SetWindowTitle(g_window, "ps2-web-recomp  saving state...");
         }
+        if (e.type == SDL_WINDOWEVENT && (e.window.event == SDL_WINDOWEVENT_FOCUS_LOST || e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED))
+            g_input_focused = e.window.event == SDL_WINDOWEVENT_FOCUS_GAINED;
+        if (e.type == SDL_AUDIODEVICEREMOVED && !e.adevice.iscapture && e.adevice.which == g_audio) g_audio_failed.store(true);
         if (e.type == SDL_KEYDOWN && e.key.keysym.scancode == SDL_SCANCODE_F11 && !e.key.repeat) {
             const bool full = SDL_GetWindowFlags(g_window) & SDL_WINDOW_FULLSCREEN;
             SDL_SetWindowFullscreen(g_window, full ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
@@ -336,20 +367,52 @@ void present() {
 
 constexpr Uint32 kAudioBytesPerMs = 48 * 4;
 
+void pace_stats() {
+    static const bool enabled = std::getenv("PS2_PACE_STATS") != nullptr;
+    if (!enabled) return;
+    static Uint64 last = 0;
+    static std::vector<double> intervals;
+    const Uint64 now = SDL_GetPerformanceCounter();
+    const double frequency = static_cast<double>(SDL_GetPerformanceFrequency());
+    if (last) intervals.push_back((now - last) * 1000.0 / frequency);
+    last = now;
+    double elapsed = 0.0;
+    for (double ms : intervals) elapsed += ms;
+    if (elapsed < 1000.0) return;
+    const double rate = intervals.size() * 1000.0 / elapsed;
+    std::sort(intervals.begin(), intervals.end());
+    std::fprintf(stderr, "[pace] %.2f fields/s p95 %.2f ms max %.2f ms audio %.1f ms underruns %u clock %s\n", rate,
+                 intervals[intervals.size() * 95 / 100], intervals.back(), g_audio ? SDL_GetQueuedAudioSize(g_audio) / static_cast<double>(kAudioBytesPerMs) : 0.0,
+                 g_audio_underruns, g_audio_started && !g_audio_failed.load() ? "audio" : "video");
+    intervals.clear();
+}
+
 void pace() {
-    if (g_audio) {
-        // The audio device clock paces emulation: wait while more than ~80 ms of sound is queued.
-        while (SDL_GetQueuedAudioSize(g_audio) > 80 * kAudioBytesPerMs) SDL_Delay(1);
-        return;
-    }
-    const std::uint64_t frequency = SDL_GetPerformanceFrequency();
-    const double period = frequency * ps2::video_timing().field_seconds();
-    const std::uint64_t now = SDL_GetPerformanceCounter();
-    if (g_last && now - g_last < period) {
-        SDL_Delay(static_cast<Uint32>((period - (now - g_last)) * 1000 / frequency));
-        g_last += period;
-    } else {
-        g_last = now;
+    pace_stats();
+    double adjustment = 0.0;
+    if (g_audio && g_audio_started && !g_audio_failed.load()) {
+        // Smooth the device's block-sized queue updates rather than releasing fields in bursts.
+        native_host::AudioProgress progress{SDL_GetQueuedAudioSize(g_audio), SDL_GetTicks()};
+        if (SDL_GetAudioDeviceStatus(g_audio) != SDL_AUDIO_PLAYING) g_audio_failed.store(true);
+        while (!g_audio_failed.load() && !ps2::halted() && SDL_GetQueuedAudioSize(g_audio) > 120 * kAudioBytesPerMs) {
+            const Uint32 queued = SDL_GetQueuedAudioSize(g_audio), now = SDL_GetTicks();
+            if (g_audio_failed.load() || SDL_GetAudioDeviceStatus(g_audio) != SDL_AUDIO_PLAYING || progress.stalled(queued, now)) {
+                g_audio_failed.store(true);
+                std::fprintf(stderr, "[audio] device stopped draining; using video pacing\n");
+                break;
+            }
+            if (!g_threaded) poll();
+            SDL_Delay(1);
+        }
+        g_audio_average += (SDL_GetQueuedAudioSize(g_audio) / static_cast<double>(kAudioBytesPerMs) - g_audio_average) * 0.02;
+        if (!g_audio_failed.load()) adjustment = std::clamp((g_audio_average - 96.0) * 0.00005, -0.001, 0.001);
+    } else g_audio_average = 96.0;
+    const double frequency = static_cast<double>(SDL_GetPerformanceFrequency());
+    const double deadline = g_deadline.advance(SDL_GetPerformanceCounter() / frequency, ps2::video_timing().field_seconds(), adjustment);
+    while (!ps2::halted() && SDL_GetPerformanceCounter() / frequency < deadline) {
+        if (!g_threaded) poll();
+        const double left = deadline - SDL_GetPerformanceCounter() / frequency;
+        if (left > 0.0) SDL_Delay(static_cast<Uint32>(std::max(1.0, left * 1000.0)));
     }
 }
 
@@ -399,6 +462,11 @@ void show_speed() {
     std::snprintf(title, sizeof title, "ps2-web-recomp  %.1f fps  CPU %.0f%%  GPU %.0f%%  RAM %.0f MB  audio %.0f ms", static_cast<double>(frames) / seconds,
                   (cpu - cpu_start) / seconds * 100.0, (gpu - gpu_start) / (seconds * 10.0), resident_mb(), queued);
     SDL_SetWindowTitle(g_window, title);
+    const int saved = g_save_status.load();
+    if (saved) {
+        SDL_SetWindowTitle(g_window, saved == 1 ? "Devil May Cry - saving quick save..." : saved == 2 ? "Devil May Cry - quick save saved (resume from launcher)" : "Devil May Cry - quick save failed; see game log");
+        if (saved != 1) g_save_status.store(0);
+    }
     start = now;
     frames = 0;
     cpu_start = cpu;
@@ -413,8 +481,29 @@ void on_vblank() {
 }
 
 void queue_audio(const std::int16_t *samples, std::size_t frames) {
-    if (SDL_GetQueuedAudioSize(g_audio) > 500 * kAudioBytesPerMs) return;
-    SDL_QueueAudio(g_audio, samples, static_cast<Uint32>(frames * 4));
+    if (!g_audio || g_audio_failed.load()) return;
+    const Uint32 queued = SDL_GetQueuedAudioSize(g_audio);
+    if ((g_audio_started && !queued) || queued > 250 * kAudioBytesPerMs) {
+        if (g_audio_started && !queued) ++g_audio_underruns;
+        SDL_PauseAudioDevice(g_audio, 1);
+        SDL_ClearQueuedAudio(g_audio);
+        g_audio_started = false;
+        g_audio_fade = 240;
+    }
+    std::vector<std::int16_t> faded;
+    if (g_audio_fade) {
+        faded.assign(samples, samples + frames * 2);
+        for (std::size_t n = 0; n < frames && g_audio_fade; ++n, --g_audio_fade)
+            for (unsigned ch = 0; ch < 2; ++ch) faded[n * 2 + ch] = static_cast<std::int16_t>(faded[n * 2 + ch] * (240 - g_audio_fade) / 240);
+        samples = faded.data();
+    }
+    if (SDL_QueueAudio(g_audio, samples, static_cast<Uint32>(frames * 4)) != 0) {
+        g_audio_failed.store(true);
+        std::fprintf(stderr, "[audio] queue failed: %s\n", SDL_GetError());
+    } else if (!g_audio_started && SDL_GetQueuedAudioSize(g_audio) >= 60 * kAudioBytesPerMs) {
+        SDL_PauseAudioDevice(g_audio, 0);
+        g_audio_started = true;
+    }
 }
 
 }
@@ -439,9 +528,14 @@ bool open_window(bool fullscreen) {
     want.samples = 1024;
     g_audio = SDL_OpenAudioDevice(nullptr, 0, &want, &have, 0);
     if (g_audio) {
-        SDL_PauseAudioDevice(g_audio, 0);
         ps2::set_audio_sink(queue_audio);
     }
+    g_input_focused = (SDL_GetWindowFlags(g_window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    ps2::g_options.on_state_saved = [](bool saved) { g_save_status.store(saved ? 2 : -1); };
+    ps2::g_options.on_state_loaded = [] {
+        std::lock_guard<std::mutex> lock(g_host_input_mutex);
+        for (int port = 0; port < 2; ++port) publish_input(port, g_host_pad[port]);
+    };
     for (int i = 0; i < SDL_NumJoysticks(); ++i)
         if (SDL_IsGameController(i)) open_pad(i);
     if (fullscreen) SDL_ShowCursor(SDL_DISABLE);
@@ -454,6 +548,7 @@ int run_window(const std::function<int()> &emulate) {
     std::fprintf(stderr, "[window] %s\n", g_gpu_present ? "presenting through WebGPU" : "presenting through SDL");
     if (!g_gpu_present && !create_renderer()) return 1;
     const bool threads = !std::getenv("PS2_ONE_THREAD") && !std::getenv("PS2_TIME") && ps2::g_options.frames_dir.empty();
+    g_threaded = threads;
     if (!threads) {
         ps2::g_options.on_vblank = on_vblank;
         return emulate();
@@ -479,6 +574,7 @@ int run_window(const std::function<int()> &emulate) {
         ps2::wake_render_thread();
     });
     const std::function<void(const std::uint32_t *, std::uint32_t, std::uint32_t)> copy = show_pixels, none;
+    profile_this_thread("render");
     while (!done.load()) {
         poll();
         if (ps2::render_pending(g_gpu_present, g_gpu_present ? none : copy, show_speed, 8.0) == ps2::Rendered::idle) ps2::wait_render_work(4);

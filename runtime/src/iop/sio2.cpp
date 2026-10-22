@@ -5,6 +5,7 @@
 #include "ps2/system.hpp"
 
 #include "ps2/state.hpp"
+#include "ps2/file.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -13,6 +14,7 @@
 #include <cstring>
 #include <deque>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 namespace ps2::iop::sio2 {
@@ -62,6 +64,7 @@ std::uint32_t g_index = 0;
 std::uint32_t g_stat = 0;
 std::deque<std::uint8_t> g_in, g_out;
 Pad g_pads[2];
+std::mutex g_pad_mutex;
 // which ports the host has a controller in; kept out of save states so loading one does not unplug a pad
 bool g_plugged[2] = {true, false};
 Feel g_feel[2];
@@ -71,6 +74,7 @@ Dma g_dma[2];
 void no_device() { g_stat |= 0xC000u | (0x10000u << (g_index & 15u)); }
 
 void controller(int port, std::size_t at, std::uint32_t out_size) {
+    std::lock_guard<std::mutex> lock(g_pad_mutex);
     const std::vector<std::uint8_t> in(g_in.begin(), g_in.end());
     if (port > 1 || !g_pads[port].connected || in.empty() || in[0] != 0x01) {
         no_device();
@@ -303,6 +307,7 @@ void run_transfer() {
 }
 
 void reset() {
+    std::lock_guard<std::mutex> lock(g_pad_mutex);
     std::memset(g_send3, 0, sizeof g_send3);
     std::memset(g_ctrl1, 0, sizeof g_ctrl1);
     std::memset(g_ctrl2, 0, sizeof g_ctrl2);
@@ -322,17 +327,15 @@ void reset() {
     load_card();
 }
 
-void flush_cards() {
+void flush_cards(bool force) {
     Card &c = g_card;
-    if (!c.dirty || ++c.quiet < 50) return;
-    c.dirty = false;
-    std::ofstream out(g_options.memcard_path, std::ios::binary | std::ios::trunc);
-    if (out) out.write(reinterpret_cast<const char *>(c.data.data()), static_cast<std::streamsize>(c.data.size()));
-    if (!out) {
+    if (!c.dirty || (!force && ++c.quiet < 50)) return;
+    c.quiet = 0;
+    if (!write_file_atomic(g_options.memcard_path, c.data.data(), c.data.size())) {
         std::fprintf(stderr, "[mc] cannot write %s\n", g_options.memcard_path.c_str());
         return;
     }
-    out.close();
+    c.dirty = false;
     if (g_options.on_memcard_saved) g_options.on_memcard_saved();
 }
 
@@ -392,18 +395,30 @@ void arm_dma(int channel, std::uint32_t madr, std::uint32_t block_words, std::ui
 }
 
 void set_buttons(int pad, std::uint16_t pressed_mask) {
+    std::lock_guard<std::mutex> lock(g_pad_mutex);
     if (pad >= 0 && pad < 2) g_pads[pad].buttons = pressed_mask;
 }
 
+void set_input(int pad, std::uint16_t buttons, const std::uint8_t axes[4], const std::uint8_t pressure[16]) {
+    if (pad < 0 || pad >= 2) return;
+    std::lock_guard<std::mutex> lock(g_pad_mutex);
+    g_pads[pad].buttons = buttons;
+    std::copy_n(axes, 4, g_pads[pad].axes);
+    std::copy_n(pressure, 16, g_feel[pad].pressure);
+}
+
 void set_axis(int pad, int axis, std::uint8_t value) {
+    std::lock_guard<std::mutex> lock(g_pad_mutex);
     if (pad >= 0 && pad < 2 && axis >= 0 && axis < 4) g_pads[pad].axes[axis] = value;
 }
 
 void set_pressure(int pad, int button, std::uint8_t value) {
+    std::lock_guard<std::mutex> lock(g_pad_mutex);
     if (pad >= 0 && pad < 2 && button >= 0 && button < 16) g_feel[pad].pressure[button] = value;
 }
 
 void set_connected(int pad, bool connected) {
+    std::lock_guard<std::mutex> lock(g_pad_mutex);
     if (pad >= 0 && pad < 2) g_pads[pad].connected = g_plugged[pad] = connected;
 }
 
@@ -422,13 +437,16 @@ void state(ps2::state::Stream &s) {
     s.pod(g_stat);
     s.deque(g_in);
     s.deque(g_out);
-    s.pod(g_pads);
-    if (s.loading()) {
-        g_pads[0].connected = g_plugged[0];
-        g_pads[1].connected = g_plugged[1];
-        for (Feel &f : g_feel) {
-            std::copy(std::begin(kLibpadMotors), std::end(kLibpadMotors), f.motors);
-            f.rumble.store(0);
+    {
+        std::lock_guard<std::mutex> lock(g_pad_mutex);
+        s.pod(g_pads);
+        if (s.loading()) {
+            g_pads[0].connected = g_plugged[0];
+            g_pads[1].connected = g_plugged[1];
+            for (Feel &f : g_feel) {
+                std::copy(std::begin(kLibpadMotors), std::end(kLibpadMotors), f.motors);
+                f.rumble.store(0);
+            }
         }
     }
     s.pod(g_dma);

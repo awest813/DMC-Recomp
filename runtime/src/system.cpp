@@ -15,6 +15,7 @@
 #include "ps2/generated.hpp"
 #include "ps2/memory.hpp"
 #include "ps2/state.hpp"
+#include "ps2/file.hpp"
 #include "ps2/system.hpp"
 
 #ifdef __EMSCRIPTEN__
@@ -51,9 +52,11 @@ struct Event {
 std::uint64_t g_base = 0;
 std::int64_t g_given = 0;
 std::vector<Event> g_events;
-bool g_halted = false;
+std::atomic<bool> g_halted{false};
+std::mutex g_halt_mutex;
 std::string g_halt_reason;
 std::uint64_t g_frames = 0;
+std::atomic<std::uint64_t> g_visible_frames{0};
 std::uint64_t g_iop_synced = 0;
 bool g_state_request = false;
 int g_state_attempts = 0;
@@ -192,6 +195,7 @@ void apply_patches(bool boot) {
 
 void vblank(std::uint64_t at) {
     ++g_frames;
+    g_visible_frames.store(g_frames, std::memory_order_relaxed);
     time_frames();
     apply_presses();
     apply_patches(false);
@@ -309,9 +313,11 @@ bool preempt(Cpu &c) {
 }
 
 void halt(const std::string &reason) {
-    if (!g_halted) std::fprintf(stderr, "[ee] halted: %s\n", reason.c_str());
-    g_halted = true;
+    std::lock_guard<std::mutex> lock(g_halt_mutex);
+    if (g_halted) return;
+    std::fprintf(stderr, "[ee] halted: %s\n", reason.c_str());
     g_halt_reason = reason;
+    g_halted.store(true);
 }
 
 bool halted() { return g_halted; }
@@ -389,11 +395,11 @@ void request_save_state(const std::string &path) {
 
 bool save_state(const std::string &path) {
     try {
+        if (!kernel::can_save_state()) throw std::runtime_error("the EE is inside an interrupt handler");
         state::Writer w;
+        w.out.reserve(64u << 20);
         machine_state(w);
-        std::ofstream out(path, std::ios::binary);
-        out.write(reinterpret_cast<const char *>(w.out.data()), static_cast<std::streamsize>(w.out.size()));
-        if (!out) throw std::runtime_error("cannot write " + path);
+        if (!write_file_atomic(path, w.out.data(), w.out.size())) throw std::runtime_error("cannot replace " + path);
         std::fprintf(stderr, "[state] saved frame %llu to %s (%zu KB)\n", static_cast<unsigned long long>(g_frames), path.c_str(), w.out.size() >> 10);
         return true;
     } catch (const std::exception &e) {
@@ -406,7 +412,9 @@ bool load_state(const std::uint8_t *data, std::size_t size) {
     try {
         state::Reader r(data, size);
         machine_state(r);
+        g_visible_frames.store(g_frames, std::memory_order_relaxed);
         g_resumed = true;
+        if (g_options.on_state_loaded) g_options.on_state_loaded();
         std::fprintf(stderr, "[state] loaded frame %llu\n", static_cast<unsigned long long>(g_frames));
         return true;
     } catch (const std::exception &e) {
@@ -425,7 +433,7 @@ bool load_state(const std::string &path) {
     return load_state(data.data(), data.size());
 }
 
-std::uint64_t frame_count() { return g_frames; }
+std::uint64_t frame_count() { return g_visible_frames.load(std::memory_order_relaxed); }
 
 bool load_elf(const std::string &path, std::uint32_t &entry) {
     std::ifstream file(path, std::ios::binary);
@@ -494,8 +502,15 @@ int run() {
     while (!g_halted) {
         if (g_state_request) {
             // A save can be refused while the EE is inside an interrupt handler; try again at the next stop.
-            const bool saved = save_state(g_options.save_state_path);
-            if (saved || ++g_state_attempts >= 1000) g_state_request = false;
+            if (kernel::can_save_state()) {
+                const bool saved = save_state(g_options.save_state_path);
+                g_state_request = false;
+                if (g_options.on_state_saved) g_options.on_state_saved(saved);
+            } else if (++g_state_attempts >= 1000) {
+                g_state_request = false;
+                std::fprintf(stderr, "[state] no safe point for quick save\n");
+                if (g_options.on_state_saved) g_options.on_state_saved(false);
+            }
         }
         c.pc &= ~kUnwind;
         run_due_events();
@@ -508,6 +523,7 @@ int run() {
         if (c.budget <= 0) refill(c);
         dispatch(c, 0, 0);
     }
+    iop::sio2::flush_cards(true);
     kernel::dump();
     iop::dump();
     sif::dump();
@@ -689,9 +705,10 @@ void browser_yield() { ps2_browser_yield(); }
 void browser_yield() {}
 #endif
 
-std::uint64_t frames_run() { return g_frames; }
+std::uint64_t frames_run() { return g_visible_frames.load(std::memory_order_relaxed); }
 std::uint64_t primitives_drawn() { return gs::primitives_drawn(); }
 void set_pad_buttons(std::uint16_t pressed, int pad) { iop::sio2::set_buttons(pad, pressed); }
+void set_pad_input(int pad, std::uint16_t buttons, const std::uint8_t axes[4], const std::uint8_t pressure[16]) { iop::sio2::set_input(pad, buttons, axes, pressure); }
 void set_pad_axis(int axis, std::uint8_t value, int pad) { iop::sio2::set_axis(pad, axis, value); }
 void set_pad_pressure(int button, std::uint8_t value, int pad) { iop::sio2::set_pressure(pad, button, value); }
 void set_pad_connected(int pad, bool connected) { iop::sio2::set_connected(pad, connected); }

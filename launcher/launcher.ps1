@@ -1,6 +1,8 @@
 # Devil May Cry launcher: plays the recompiled game in a native window or in the browser.
 # Start it with "Play Devil May Cry.bat" in the repository root.
-param([ValidateSet('', 'native', 'browser')][string]$Play = '', [switch]$DryRun, [string]$Snapshot = '')
+param([ValidateSet('', 'native', 'browser')][string]$Play = '', [switch]$DryRun, [string]$Snapshot = '',
+      [ValidateSet('Play', 'Settings', 'Help', 'Controls')][string]$SnapshotPage = 'Play', [string]$SettingsFile = '',
+      [switch]$Resume, [string]$Disc = '', [string]$MemoryCard = '', [ValidateRange(0, 3)][int]$Scale = 0)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -28,6 +30,7 @@ $Native = Join-Path $Root 'build\native-dmc\ps2run.exe'
 $WebDir = Join-Path $Root 'build\web-dmc'
 $Elf = Join-Path $Game 'disc\SLUS_202.16'
 $SettingsPath = Join-Path $Game 'launcher.json'
+if ($SettingsFile) { $SettingsPath = [System.IO.Path]::GetFullPath($SettingsFile) }
 $ControlsPath = Join-Path $Game 'controls.txt'
 
 # Pad input, what it does in DMC, default keys. Key names: letters, digits, Up Down Left Right, Enter, Backspace, Space, Tab, LShift, RShift, LCtrl.
@@ -43,8 +46,8 @@ $ControlRows = @(
 function Read-Controls {
     $map = [ordered]@{}
     foreach ($row in $ControlRows) { $map[$row[0]] = $row[2] }
-    if (Test-Path $ControlsPath) {
-        foreach ($line in Get-Content $ControlsPath) {
+    if (Test-Path -LiteralPath $ControlsPath) {
+        foreach ($line in Get-Content -LiteralPath $ControlsPath) {
             if ($line -match '^\s*([a-z0-9]+)\s*=\s*(.*?)\s*$' -and $map.Contains($Matches[1])) { $map[$Matches[1]] = $Matches[2] }
         }
     }
@@ -54,7 +57,7 @@ function Read-Controls {
 function Write-Controls($map) {
     $lines = @('# Devil May Cry controls: input=key[,key]. Written by the launcher; read by the native window (PS2_KEYS) and the browser (?keys=).')
     foreach ($k in $map.Keys) { $lines += "$k=$($map[$k])" }
-    $lines | Set-Content -Encoding ASCII $ControlsPath
+    $lines | Set-Content -Encoding ASCII -LiteralPath $ControlsPath
 }
 
 function Controls-Param($map) {
@@ -68,14 +71,27 @@ $settings = [ordered]@{
     scale      = 2
     fullscreen = $false
     widescreen = $false
+    mode       = 'native'
 }
-if (Test-Path $SettingsPath) {
+if (Test-Path -LiteralPath $SettingsPath) {
     try {
-        $saved = Get-Content $SettingsPath -Raw | ConvertFrom-Json
+        $saved = Get-Content -LiteralPath $SettingsPath -Raw | ConvertFrom-Json
         foreach ($key in @($settings.Keys)) { if ($null -ne $saved.$key) { $settings[$key] = $saved.$key } }
     } catch {}
 }
-function Save-Settings { $settings | ConvertTo-Json | Set-Content -Encoding UTF8 $SettingsPath }
+if ($Play) { $settings.mode = $Play }
+if ($Disc) { $settings.iso = $Disc }
+if ($MemoryCard) { $settings.memcard = $MemoryCard }
+if ($Scale) { $settings.scale = $Scale }
+$storedScale = 2
+if (-not [int]::TryParse([string]$settings.scale, [ref]$storedScale)) { $storedScale = 2 }
+$settings.scale = [Math]::Max(1, [Math]::Min(3, $storedScale))
+if ($settings.mode -notin @('native', 'browser')) { $settings.mode = 'native' }
+function Save-Settings {
+    if ($DryRun -or $Snapshot) { return }
+    New-Item -ItemType Directory -Force (Split-Path $SettingsPath -Parent) | Out-Null
+    $settings | ConvertTo-Json | Set-Content -Encoding UTF8 -LiteralPath $SettingsPath
+}
 
 $script:server = $null
 $script:gameProcess = $null
@@ -94,206 +110,241 @@ function Find-Browser {
     return $null
 }
 
-# ---- window ----
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'Devil May Cry'
-$form.ClientSize = New-Object System.Drawing.Size(560, 520)
-$form.FormBorderStyle = 'FixedSingle'
-$form.MaximizeBox = $false
-$form.StartPosition = 'CenterScreen'
-$form.BackColor = [System.Drawing.Color]::FromArgb(24, 18, 20)
-$form.ForeColor = [System.Drawing.Color]::FromArgb(235, 228, 228)
-$form.Font = New-Object System.Drawing.Font('Segoe UI', 9.5)
-
-function Add-Label($text, $x, $y, $w = 120, $font = $null) {
-    $l = New-Object System.Windows.Forms.Label
-    $l.Text = $text; $l.Location = New-Object System.Drawing.Point($x, $y); $l.Size = New-Object System.Drawing.Size($w, 22)
-    if ($font) { $l.Font = $font }
-    $form.Controls.Add($l); return $l
-}
-function Add-Button($text, $x, $y, $w, $h = 30) {
-    $b = New-Object System.Windows.Forms.Button
-    $b.Text = $text; $b.Location = New-Object System.Drawing.Point($x, $y); $b.Size = New-Object System.Drawing.Size($w, $h)
-    $b.FlatStyle = 'Flat'; $b.BackColor = [System.Drawing.Color]::FromArgb(58, 30, 34); $b.ForeColor = $form.ForeColor
-    $b.FlatAppearance.BorderColor = [System.Drawing.Color]::FromArgb(140, 40, 48)
-    $form.Controls.Add($b); return $b
-}
-function Add-PathRow($label, $y, $value, $filter, $save) {
-    Add-Label $label 20 ($y + 3) 100 | Out-Null
-    $t = New-Object System.Windows.Forms.TextBox
-    $t.Location = New-Object System.Drawing.Point(120, $y); $t.Size = New-Object System.Drawing.Size(330, 24); $t.Text = $value
-    $t.BackColor = [System.Drawing.Color]::FromArgb(40, 32, 34); $t.ForeColor = $form.ForeColor; $t.BorderStyle = 'FixedSingle'
-    $form.Controls.Add($t)
-    $b = Add-Button 'Browse...' 460 ($y - 2) 80 28
-    $b.Add_Click({
-        $d = if ($save) { New-Object System.Windows.Forms.SaveFileDialog } else { New-Object System.Windows.Forms.OpenFileDialog }
-        $d.Filter = $filter
-        if ($save) { $d.OverwritePrompt = $false }
-        if ($t.Text) { try { $d.InitialDirectory = Split-Path $t.Text -Parent; $d.FileName = Split-Path $t.Text -Leaf } catch {} }
-        if ($d.ShowDialog() -eq 'OK') { $t.Text = $d.FileName }
-    }.GetNewClosure())
-    return $t
-}
-
-$title = Add-Label 'DEVIL MAY CRY' 20 14 400 (New-Object System.Drawing.Font('Georgia', 20, [System.Drawing.FontStyle]::Bold))
-$title.Size = New-Object System.Drawing.Size(400, 40)
-$title.ForeColor = [System.Drawing.Color]::FromArgb(210, 40, 50)
-(Add-Label 'PS2 static recompilation - SLUS_202.16' 22 54 400).ForeColor = [System.Drawing.Color]::FromArgb(160, 150, 150)
-
-$isoBox = Add-PathRow 'Disc image' 92 $settings.iso 'Disc images (*.iso)|*.iso|All files|*.*' $false
-$cardBox = Add-PathRow 'Memory card' 126 $settings.memcard 'PS2 memory cards (*.ps2)|*.ps2|All files|*.*' $true
-
-Add-Label 'Resolution' 20 166 100 | Out-Null
-$scaleBox = New-Object System.Windows.Forms.ComboBox
-$scaleBox.DropDownStyle = 'DropDownList'; $scaleBox.Location = New-Object System.Drawing.Point(120, 163); $scaleBox.Size = New-Object System.Drawing.Size(200, 24)
-[void]$scaleBox.Items.AddRange(@('1x  (native, 640x448)', '2x  (1280x896)', '3x  (1920x1344)'))
-$scaleBox.SelectedIndex = [Math]::Max(0, [Math]::Min(2, [int]$settings.scale - 1))
-$form.Controls.Add($scaleBox)
-
-$fullBox = New-Object System.Windows.Forms.CheckBox
-$fullBox.Text = 'Fullscreen (F11 toggles in game)'; $fullBox.Location = New-Object System.Drawing.Point(120, 196); $fullBox.Size = New-Object System.Drawing.Size(300, 24); $fullBox.Checked = [bool]$settings.fullscreen
-$form.Controls.Add($fullBox)
-$wideBox = New-Object System.Windows.Forms.CheckBox
-$wideBox.Text = 'Widescreen 16:9 (DMC draws 4:3, so this stretches)'; $wideBox.Location = New-Object System.Drawing.Point(120, 222); $wideBox.Size = New-Object System.Drawing.Size(400, 24); $wideBox.Checked = [bool]$settings.widescreen
-$form.Controls.Add($wideBox)
-
-$playNative = Add-Button 'Play' 20 262 255 44
-$playNative.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
-$playWeb = Add-Button 'Play in browser' 285 262 255 44
-$playWeb.Font = New-Object System.Drawing.Font('Segoe UI', 12)
-
-$controlsButton = Add-Button 'Controls...' 440 196 100 28
-$controlsButton.Add_Click({ Show-Controls })
-
-$padLabel = Add-Label '' 20 318 520
-$statusLabel = Add-Label 'Ready.' 20 342 520
-$statusLabel.ForeColor = [System.Drawing.Color]::FromArgb(170, 160, 160)
-
-$help = New-Object System.Windows.Forms.Label
-$help.Location = New-Object System.Drawing.Point(20, 372); $help.Size = New-Object System.Drawing.Size(520, 140)
-$help.Font = New-Object System.Drawing.Font('Consolas', 9)
-$help.ForeColor = [System.Drawing.Color]::FromArgb(190, 180, 180)
-$help.Text = @'
-Default keys (change with Controls...)  Controller (Xbox layout)
-  Arrows / I J K L  move                  Left stick  move
-  S  action / jump (Triangle)             Y  action    B  sword
-  X  sword (Circle)                       X  shoot     A  shoot / OK
-  A  shoot (Square)    Z  examine / OK    RB aim       LB devil trigger
-  W  aim (R1)    Q  devil trigger (L1)    LT map       RS devil arm
-  1  map (L2)    T F G H  devil arm       Start menu   Back options
-  Enter  menu (Start)   F11 fullscreen   F5 quick-save state (window)
-'@
-$form.Controls.Add($help)
+. (Join-Path $PSScriptRoot 'view.ps1')
 
 function Show-Controls {
     $map = Read-Controls
     $dlg = New-Object System.Windows.Forms.Form
     $dlg.Text = 'Controls'; $dlg.FormBorderStyle = 'FixedDialog'; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
     $dlg.StartPosition = 'CenterParent'; $dlg.BackColor = $form.BackColor; $dlg.ForeColor = $form.ForeColor; $dlg.Font = $form.Font
-    $dlg.ClientSize = New-Object System.Drawing.Size(420, (60 + 27 * $ControlRows.Count + 50))
+    $dlg.ClientSize = New-Object System.Drawing.Size(540, 590)
     $note = New-Object System.Windows.Forms.Label
     $note.Text = 'Keys per input, comma separated: letters, digits, Up, Down, Left, Right, Enter, Backspace, Space, Tab, LShift, LCtrl.'
-    $note.Location = New-Object System.Drawing.Point(14, 10); $note.Size = New-Object System.Drawing.Size(395, 40)
+    $note.Location = New-Object System.Drawing.Point(18, 14); $note.Size = New-Object System.Drawing.Size(500, 48)
     $dlg.Controls.Add($note)
     $boxes = @{}
-    $y = 56
+    $scroll = New-Object System.Windows.Forms.Panel
+    $scroll.Location = New-Object System.Drawing.Point(14, 72); $scroll.Size = New-Object System.Drawing.Size(512, 450); $scroll.AutoScroll = $true
+    $dlg.Controls.Add($scroll)
+    $y = 0
     foreach ($row in $ControlRows) {
         $l = New-Object System.Windows.Forms.Label
-        $l.Text = $row[1]; $l.Location = New-Object System.Drawing.Point(14, ($y + 3)); $l.Size = New-Object System.Drawing.Size(200, 22)
+        $l.Text = $row[1]; $l.Location = New-Object System.Drawing.Point(4, ($y + 3)); $l.Size = New-Object System.Drawing.Size(270, 24)
         $t = New-Object System.Windows.Forms.TextBox
-        $t.Text = $map[$row[0]]; $t.Location = New-Object System.Drawing.Point(220, $y); $t.Size = New-Object System.Drawing.Size(185, 24)
+        $t.Text = $map[$row[0]]; $t.Location = New-Object System.Drawing.Point(280, $y); $t.Size = New-Object System.Drawing.Size(195, 26)
         $t.BackColor = [System.Drawing.Color]::FromArgb(40, 32, 34); $t.ForeColor = $form.ForeColor; $t.BorderStyle = 'FixedSingle'
-        $dlg.Controls.Add($l); $dlg.Controls.Add($t)
+        $scroll.Controls.Add($l); $scroll.Controls.Add($t)
         $boxes[$row[0]] = $t
-        $y += 27
+        $y += 34
     }
     $ok = New-Object System.Windows.Forms.Button
-    $ok.Text = 'Save'; $ok.DialogResult = 'OK'; $ok.Location = New-Object System.Drawing.Point(220, ($y + 10)); $ok.Size = New-Object System.Drawing.Size(90, 30)
+    $ok.Text = 'Save changes'; $ok.Location = New-Object System.Drawing.Point(18, 544); $ok.Size = New-Object System.Drawing.Size(150, 32)
+    $ok.Add_Click({
+        foreach ($box in $boxes.Values) {
+            foreach ($key in ($box.Text -split ',')) {
+                if ($key.Trim() -and $key.Trim() -notmatch '^(?:[a-z0-9]|Up|Down|Left|Right|Enter|Return|Backspace|Space|Tab|Escape|LShift|RShift|LCtrl|RCtrl|LAlt)$') {
+                    [void][System.Windows.Forms.MessageBox]::Show($dlg, "Unknown key: $key. Use a letter, digit or one of the named keys above.", 'Check keyboard mapping')
+                    $box.Focus() | Out-Null
+                    return
+                }
+            }
+        }
+        $dlg.DialogResult = 'OK'
+    }.GetNewClosure())
     $reset = New-Object System.Windows.Forms.Button
-    $reset.Text = 'Defaults'; $reset.Location = New-Object System.Drawing.Point(315, ($y + 10)); $reset.Size = New-Object System.Drawing.Size(90, 30)
+    $reset.Text = 'Restore defaults'; $reset.Location = New-Object System.Drawing.Point(182, 544); $reset.Size = New-Object System.Drawing.Size(160, 32)
     $reset.Add_Click({ foreach ($row in $ControlRows) { $boxes[$row[0]].Text = $row[2] } }.GetNewClosure())
-    foreach ($b in @($ok, $reset)) { $b.FlatStyle = 'Flat'; $b.BackColor = [System.Drawing.Color]::FromArgb(58, 30, 34); $dlg.Controls.Add($b) }
+    $cancel = New-Object System.Windows.Forms.Button
+    $cancel.Text = 'Cancel'; $cancel.DialogResult = 'Cancel'; $cancel.Location = New-Object System.Drawing.Point(356, 544); $cancel.Size = New-Object System.Drawing.Size(160, 32)
+    foreach ($b in @($ok, $reset, $cancel)) { $b.FlatStyle = 'Flat'; $b.BackColor = [System.Drawing.Color]::FromArgb(58, 30, 34); $dlg.Controls.Add($b) }
+    $dlg.CancelButton = $cancel
     $dlg.AcceptButton = $ok
-    if ($dlg.ShowDialog($form) -eq 'OK') {
-        foreach ($row in $ControlRows) { $map[$row[0]] = ($boxes[$row[0]].Text -replace '\s', '') }
-        Write-Controls $map
-        $statusLabel.Text = 'Controls saved to games\dmc\controls.txt (used next time you press Play).'
+    if ($Snapshot -and $SnapshotPage -eq 'Controls') {
+        $dlg.Add_Shown({
+            $dlg.Refresh()
+            $image = New-Object System.Drawing.Bitmap($dlg.Width, $dlg.Height)
+            try {
+                $dlg.DrawToBitmap($image, (New-Object System.Drawing.Rectangle(0, 0, $dlg.Width, $dlg.Height)))
+                $image.Save($Snapshot)
+            } finally { $image.Dispose() }
+            $dlg.DialogResult = 'Cancel'
+        }.GetNewClosure())
     }
+    if ($dlg.ShowDialog($form) -eq 'OK') {
+        foreach ($row in $ControlRows) {
+            $names = foreach ($key in ($boxes[$row[0]].Text -split ',')) {
+                $name = $key.Trim()
+                if ($name.Length -eq 1) { $name.ToUpperInvariant() }
+                elseif ($name) {
+                    $canonical = @('Up','Down','Left','Right','Enter','Return','Backspace','Space','Tab','Escape','LShift','RShift','LCtrl','RCtrl','LAlt') | Where-Object { $_ -ieq $name } | Select-Object -First 1
+                    $canonical
+                }
+            }
+            $map[$row[0]] = $names -join ','
+        }
+        try {
+            Write-Controls $map
+            $statusLabel.Text = 'Keyboard controls saved. They apply the next time you start the game.'
+        } catch {
+            $statusLabel.Text = 'Keyboard controls could not be saved: ' + $_.Exception.Message
+            [void][System.Windows.Forms.MessageBox]::Show($form, $statusLabel.Text, 'Unable to save controls', 'OK', 'Warning')
+        }
+    }
+    $dlg.Dispose()
 }
 
 function Read-Form {
     $settings.iso = $isoBox.Text.Trim()
     $settings.memcard = $cardBox.Text.Trim()
+    if ($settings.iso) { $settings.iso = [System.IO.Path]::GetFullPath($settings.iso) }
+    if ($settings.memcard) { $settings.memcard = [System.IO.Path]::GetFullPath($settings.memcard) }
     $settings.scale = $scaleBox.SelectedIndex + 1
     $settings.fullscreen = $fullBox.Checked
     $settings.widescreen = $wideBox.Checked
+    $settings.mode = if ($browserMode.Checked) { 'browser' } else { 'native' }
     Save-Settings
 }
 
+function Save-Form {
+    try { Read-Form; return $true }
+    catch {
+        $statusLabel.Text = 'Settings could not be saved: ' + $_.Exception.Message
+        [void][System.Windows.Forms.MessageBox]::Show($form, $statusLabel.Text, 'Unable to save settings', 'OK', 'Warning')
+        return $false
+    }
+}
+
 function Check-Disc {
-    if (-not $settings.iso -or -not (Test-Path $settings.iso)) {
+    if (-not $settings.iso -or -not (Test-Path -LiteralPath $settings.iso -PathType Leaf)) {
+        if ($DryRun) { throw 'Choose an existing disc image (.iso).' }
         [System.Windows.Forms.MessageBox]::Show('Choose your Devil May Cry disc image (.iso) first.', 'Devil May Cry') | Out-Null
         return $false
     }
     return $true
 }
 
-function Start-Native {
+function Start-Native([bool]$FromQuickSave = $false) {
     Read-Form
     if (-not (Check-Disc)) { return }
     foreach ($need in @($Native, (Join-Path (Split-Path $Native) 'SDL2.dll'), $Elf)) {
-        if (-not (Test-Path $need)) {
+        if (-not (Test-Path -LiteralPath $need -PathType Leaf)) {
+            if ($DryRun) { throw "Missing $need" }
             [System.Windows.Forms.MessageBox]::Show("Missing $need`nBuild the native runner first (see HANDOFF.md, 'Native window').", 'Devil May Cry') | Out-Null
             return
         }
     }
     if ($script:gameProcess -and -not $script:gameProcess.HasExited) { $statusLabel.Text = 'The game is already running.'; return }
-    New-Item -ItemType Directory -Force (Split-Path $settings.memcard) | Out-Null
+    if (-not $settings.memcard) { throw 'Choose a window memory-card filename in Settings.' }
+    $settings.memcard = [System.IO.Path]::GetFullPath($settings.memcard)
+    if (Test-Path -LiteralPath $settings.memcard -PathType Container) { throw 'Choose a memory-card file, not a folder.' }
     $gameArgs = @("`"$Elf`"", '--disc', "`"$($settings.iso)`"", '--memcard', "`"$($settings.memcard)`"", '--window')
     if ($settings.fullscreen) { $gameArgs += '--fullscreen' }
     if ($settings.widescreen) { $gameArgs += '--widescreen' }
+    if ($FromQuickSave) {
+        $quick = Join-Path $Game 'quicksave.ps2'
+        if (-not (Test-Path -LiteralPath $quick -PathType Leaf)) { throw 'No quick save yet. Press F5 while playing in a window.' }
+        $gameArgs += @('--load-state', "`"$quick`"")
+    }
+    if ($DryRun) { Write-Output "native: scale=$($settings.scale) $Native $($gameArgs -join ' ')"; return }
+    New-Item -ItemType Directory -Force (Split-Path $settings.memcard) | Out-Null
     $env:PS2_SCALE = [string]$settings.scale
     Write-Controls (Read-Controls)
     $env:PS2_KEYS = $ControlsPath
     $env:PS2_QUICKSAVE = Join-Path $Game 'quicksave.ps2'
-    if ($DryRun) { Write-Output "native: PS2_SCALE=$env:PS2_SCALE PS2_KEYS=$env:PS2_KEYS $Native $($gameArgs -join ' ')"; return }
-    # CreateNoWindow hides the runner's console without touching the game window; -WindowStyle Hidden would hide that too.
-    $start = New-Object System.Diagnostics.ProcessStartInfo
-    $start.FileName = "$env:SystemRoot\System32\cmd.exe"
-    $start.Arguments = "/s /c `"`"$Native`" $($gameArgs -join ' ') 2> `"$(Join-Path $Game 'launcher-game.log')`" > `"$(Join-Path $Game 'launcher-game.out')`"`""
-    $start.WorkingDirectory = $Root
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $script:gameProcess = [System.Diagnostics.Process]::Start($start)
-    $statusLabel.Text = "Running in a window at $($settings.scale)x. Log: games\dmc\launcher-game.log"
+    # Launch the window executable directly; file paths never pass through cmd.exe.
+    $script:gameProcess = Start-Process -FilePath $Native -ArgumentList $gameArgs -WorkingDirectory $Root -PassThru -WindowStyle Normal `
+        -RedirectStandardError (Join-Path $Game 'launcher-game.log') -RedirectStandardOutput (Join-Path $Game 'launcher-game.out')
+    $statusLabel.Text = "Playing in a window at $($settings.scale)x. You can leave this launcher open."
 }
-$playNative.Add_Click({ Start-Native })
 
-function Start-Browser {
+function Start-Browser([bool]$FromQuickSave = $false) {
     Read-Form
     if (-not (Check-Disc)) { return }
-    if (-not (Test-Path (Join-Path $WebDir 'ps2web.html'))) {
+    if (@('ps2web.html', 'ps2web.js', 'ps2web.wasm', 'ps2web.data') | Where-Object { -not (Test-Path -LiteralPath (Join-Path $WebDir $_) -PathType Leaf) }) {
+        if ($DryRun) { throw 'The browser build is missing.' }
         [System.Windows.Forms.MessageBox]::Show("The web build is missing. Build it with:`nscripts\build_web.ps1 dmc", 'Devil May Cry') | Out-Null
         return
     }
-    if (-not (Test-Port)) {
+    # Keep the original browser origin so existing browser memory cards remain available.
+    $url = "http://localhost:$Port/ps2web.html?PS2_SCALE=$($settings.scale)&aspect=" + $(if ($settings.widescreen) { '16:9' } else { '4:3' }) + '&keys=' + (Controls-Param (Read-Controls))
+    if ($FromQuickSave) {
+        $quick = Join-Path $Game 'quicksave.ps2'
+        if (-not (Test-Path -LiteralPath $quick -PathType Leaf)) { throw 'No quick save yet. Press F5 while playing in a window.' }
+        $url += '&state=launcher-quicksave.ps2'
+    }
+    if ($DryRun) { Write-Output "browser: $url"; return }
+    if (Test-Port) {
+        try {
+            $identity = Invoke-RestMethod -Uri "http://localhost:$Port/__ps2web_status" -TimeoutSec 2
+            if ($identity.application -ne 'ps2-web-recomp' -or $identity.disc -ne [System.IO.Path]::GetFullPath($settings.iso) -or $identity.build -ne $WebDir) { throw 'Different session' }
+        } catch { throw 'Another session is using the browser address. Close its launcher and try again, or choose Window.' }
+    } else {
         $python = (Get-Command python -ErrorAction SilentlyContinue).Source
         if (-not $python) { [System.Windows.Forms.MessageBox]::Show('Python 3 is needed to serve the browser version.', 'Devil May Cry') | Out-Null; return }
         $script:server = Start-Process -FilePath $python -ArgumentList @("`"$(Join-Path $Root 'scripts\serve.py')`"", "`"$WebDir`"", "`"$($settings.iso)`"", $Port) `
             -WorkingDirectory $Root -PassThru -WindowStyle Hidden
-        for ($i = 0; $i -lt 50 -and -not (Test-Port); ++$i) { Start-Sleep -Milliseconds 100 }
+        try {
+            for ($i = 0; $i -lt 50 -and -not (Test-Port); ++$i) { Start-Sleep -Milliseconds 100 }
+            if (-not (Test-Port)) { throw 'Server did not start' }
+            $identity = Invoke-RestMethod -Uri "http://localhost:$Port/__ps2web_status" -TimeoutSec 2
+            if ($script:server.HasExited -or $identity.application -ne 'ps2-web-recomp' -or $identity.disc -ne $settings.iso -or $identity.build -ne $WebDir) { throw 'Different session' }
+        } catch {
+            if (-not $script:server.HasExited) { Stop-Process -Id $script:server.Id -ErrorAction SilentlyContinue }
+            $script:server = $null
+            throw 'The browser server did not become ready for this disc. Check Python and try again.'
+        }
     }
-    $url = "http://localhost:$Port/?PS2_SCALE=$($settings.scale)&aspect=" + $(if ($settings.widescreen) { '16:9' } else { '4:3' }) + '&keys=' + (Controls-Param (Read-Controls))
-    if ($DryRun) { Write-Output "browser: $url"; return }
+    if ($FromQuickSave) { Copy-Item -LiteralPath $quick -Destination (Join-Path $WebDir 'launcher-quicksave.ps2') }
     $browser = Find-Browser
     if ($browser) { Start-Process -FilePath $browser -ArgumentList @("--app=$url", '--start-maximized') } else { Start-Process $url }
-    $statusLabel.Text = "Serving on http://localhost:$Port/ - the server stops when this launcher closes."
+    $statusLabel.Text = if ($script:server) { 'Browser game opened. Keep this launcher open while you play.' } else { 'Browser game opened using the matching local game server.' }
 }
-$playWeb.Add_Click({ Start-Browser })
+
+function Invoke-Play([bool]$FromQuickSave = $false) {
+    try {
+        if ($browserMode.Checked) { Start-Browser $FromQuickSave } else { Start-Native $FromQuickSave }
+    } catch {
+        if ($DryRun) { throw }
+        $statusLabel.Text = $_.Exception.Message
+        [void][System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, 'Unable to start game', 'OK', 'Warning')
+    }
+}
+$playButton.Add_Click({ Invoke-Play })
+$resumeButton.Add_Click({ Invoke-Play $true })
+
+function Update-Readiness {
+    $missing = @()
+    if (-not $isoBox.Text.Trim() -or -not (Test-Path -LiteralPath $isoBox.Text -PathType Leaf -ErrorAction SilentlyContinue)) { $missing += 'Choose a disc image in Settings.' }
+    if ($browserMode.Checked) {
+        foreach ($name in @('ps2web.html', 'ps2web.js', 'ps2web.wasm', 'ps2web.data')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $WebDir $name) -PathType Leaf)) { $missing += 'The browser version needs to be built. See HANDOFF.md.'; break }
+        }
+    } else {
+        foreach ($name in @($Native, $Elf, (Join-Path (Split-Path $Native) 'SDL2.dll'))) {
+            if (-not (Test-Path -LiteralPath $name -PathType Leaf)) { $missing += 'The window version needs to be built. See HANDOFF.md.'; break }
+        }
+        if (-not $cardBox.Text.Trim()) { $missing += 'Choose a memory-card filename in Settings.' }
+    }
+    $running = $script:gameProcess -and -not $script:gameProcess.HasExited
+    $summaryTitle.Text = if ($missing.Count) { 'A little setup first' } elseif ($running) { 'Game is running' } else { 'Ready to play' }
+    $summaryTitle.ForeColor = if ($missing.Count) { [System.Drawing.Color]::FromArgb(239, 188, 111) } else { [System.Drawing.Color]::FromArgb(201, 224, 198) }
+    $summaryDetail.Text = if ($missing.Count) { $missing -join ' ' } else { 'Start at the title screen, or pick up from your last quick save.' }
+    $playButton.Enabled = $missing.Count -eq 0 -and -not $running
+    $quick = Join-Path $Game 'quicksave.ps2'
+    $haveQuick = Test-Path -LiteralPath $quick -PathType Leaf
+    $resumeButton.Enabled = $playButton.Enabled -and $haveQuick
+    $resumeInfo.Text = if ($haveQuick) { 'Quick save: ' + (Get-Item -LiteralPath $quick).LastWriteTime.ToString('g') } else { 'No quick save yet. In a window, press F5 to create one.' }
+    $fullBox.Enabled = $windowMode.Checked
+}
+$windowMode.Add_CheckedChanged({ Update-Readiness })
+$browserMode.Add_CheckedChanged({ Update-Readiness })
+$isoBox.Add_TextChanged({ Update-Readiness })
+$cardBox.Add_TextChanged({ Update-Readiness })
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 1500
 $updatePads = {
+    Update-Readiness
     $n = [XInputProbe]::Connected()
     $padLabel.Text = switch ($n) { -1 { 'Controller: XInput not available (keyboard works)' } 0 { 'Controller: none detected - keyboard controls below' } 1 { 'Controller: 1 connected' } default { "Controllers: $n connected (player 1 and 2)" } }
     if ($script:gameProcess -and $script:gameProcess.HasExited) {
@@ -305,25 +356,36 @@ $timer.Add_Tick($updatePads)
 & $updatePads
 $timer.Start()
 
-$form.Add_Shown({ $playNative.Focus() | Out-Null })
+$form.Add_Shown({ $playButton.Focus() | Out-Null })
 $form.Add_FormClosing({
-    Read-Form
+    $closingEvent = $_
+    if (-not $Snapshot -and $script:server -and -not $script:server.HasExited) {
+        $answer = [System.Windows.Forms.MessageBox]::Show($form, 'Closing this launcher stops the browser game server. Close anyway?', 'Close launcher?', 'YesNo', 'Question', 'Button2')
+        if ($answer -ne 'Yes') { $_.Cancel = $true; return }
+    }
+    if (-not $Snapshot -and -not (Save-Form)) { $closingEvent.Cancel = $true; return }
     $timer.Stop()
     if ($script:server -and -not $script:server.HasExited) { Stop-Process -Id $script:server.Id -Force -ErrorAction SilentlyContinue }
 })
 if ($Snapshot) {
+    if ($SnapshotPage -ne 'Controls') { $tabs.SelectedTab = $pages[$SnapshotPage] }
     $form.Add_Shown({
-        $form.Refresh()
-        $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
-        $form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
-        $bmp.Save($Snapshot)
+        if ($SnapshotPage -eq 'Controls') { Show-Controls }
+        else {
+            $form.Refresh()
+            $bmp = New-Object System.Drawing.Bitmap($form.Width, $form.Height)
+            try {
+                $form.DrawToBitmap($bmp, (New-Object System.Drawing.Rectangle(0, 0, $form.Width, $form.Height)))
+                $bmp.Save($Snapshot)
+            } finally { $bmp.Dispose() }
+        }
         $form.Close()
     })
     [void]$form.ShowDialog()
     return
 }
 if ($Play) {
-    if ($Play -eq 'native') { Start-Native } else { Start-Browser }
+    Invoke-Play ([bool]$Resume)
     if ($DryRun) { return }
     if ($script:gameProcess) { $script:gameProcess.WaitForExit() }
     if ($script:server) { Write-Output 'Serving the browser version; close this window to stop.'; $script:server.WaitForExit() }

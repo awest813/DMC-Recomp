@@ -20,6 +20,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc);
 void service(Cpu &c);
 bool must_unwind();
 bool in_handler();
+bool can_save_state();
 bool interruptible();
 int current_thread();
 void on_vblank_start();

@@ -1,4 +1,4 @@
-# Audio accuracy - 2026-10-21
+# Audio accuracy - 2026-10-22
 
 ## Implemented: SPU2 Gaussian interpolation
 
@@ -18,7 +18,7 @@ VMIXL/VMIXR and VMIXEL/VMIXER now independently gate each of the 24 voices into 
 
 Register addresses and routing order were checked against [PCSX2's SPU2 register map](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/SPU2/regs.h), [mixer](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/SPU2/Mixer.cpp), and [initialization/register writes](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/SPU2/spu2sys.cpp). Reference initialization enables all 24 bits of each voice mask. Existing saved states already store these registers; no layout or version change is needed and no saved masks are overwritten on load.
 
-The SPU2 target now runs 35,431 assertions. Routing coverage includes all 16 dry/wet gate combinations, both cores, voices 0/15/16/23, output and capture samples, muted-state advancement, exact state restoration, wet capture IRQA, independent bus saturation and raw voice capture. This implements the voice-bus stage; MMIX input/external routing and the core-to-core output chain remain open.
+The voice-routing stage brought the SPU2 target to 35,431 assertions. Coverage includes all 16 dry/wet gate combinations, both cores, voices 0/15/16/23, output and capture samples, muted-state advancement, exact state restoration, wet capture IRQA, independent bus saturation and raw voice capture. The dry core-routing stage below extends this coverage.
 
 ## Validation
 
@@ -30,7 +30,13 @@ The user reported scratchy audio at the beginning. The worklet consumed any arri
 
 `node scripts/test_web_audio.mjs` executes the actual embedded worklet with a deterministic shared-memory producer. It verifies silent prebuffering without consuming samples, exact steady PCM, partial-quantum starvation, bounded fade steps, recovery, stereo, pacing activation, and 32-bit counter wrap. Device startup buffering does not affect the emulated mixer WAV captures. Physical listening and sustained overload still need separate coverage.
 
-`ps2_spu2_accuracy` runs 10,457 disc-free assertions: coefficient identity, exact phase vectors, ignored low fractional bits, per-product rounding, both cores, stationary/half/unity/high pitches, block and loop boundaries, stereo gain, key-on history reset, state restoration, deterministic legacy-state migration, PCM bypass, and 48 kHz sample counts.
+## Implemented: dry core output routing
+
+MMIX now gates dry voice and AutoDMA input channels independently. Core 0 feeds core 1's external path through core 0 master gain, the signed core 1 external gains, MMIX external gates and core 1 master gain. Core 1 supplies the final output; the cores are no longer added independently at the host. Dry sources saturate before master gain, and the core 0 capture rings contain the pre-external-gain signal. This follows the [PCSX2 core mixer](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/SPU2/Mixer.cpp) and [MMIX register mapping](https://github.com/PCSX2/pcsx2/blob/master/pcsx2/SPU2/spu2sys.cpp). Existing state fields already contain MMIX and all gains; the state format is unchanged.
+
+The SPU2 target now has 37,479 assertions, including independent voice/input/external channel gates and zero, positive and negative external gains. Seven CTest targets and all nine GPU game regressions pass without a reference-frame refresh. Native and browser builds succeed. Four new captures in `games/dmc/audio-accuracy/core-routing` retain the same sample counts and have no clipped samples or detected dropouts. Applying the additional core gain stages changes at most three signed 16-bit levels in these clips; RMS changes by less than 0.0015 dB. These are reference-model checks, not physical PS2 capture comparisons.
+
+The Gaussian interpolation stage initially ran 10,457 disc-free assertions: coefficient identity, exact phase vectors, ignored low fractional bits, per-product rounding, both cores, stationary/half/unity/high pitches, block and loop boundaries, stereo gain, key-on history reset, state restoration, deterministic legacy-state migration, PCM bypass, and 48 kHz sample counts. These remain part of the current 37,479-check SPU2 suite.
 
 ```powershell
 cmake -S . -B build/native-dmc -DPS2_BUILD_ACCURACY_TESTS=ON
@@ -58,6 +64,6 @@ Native and web builds succeed. A 20-second headless Chrome check loaded the exis
 
 - Reverb processing/return is still unimplemented; routed wet voice capture rings now contain their input samples.
 - Voice noise and pitch modulation still need implementation and focused tests.
-- MMIX dry/wet input/external gates, external gains and the core-to-core output chain remain incomplete; the host output still combines the two core dry outputs through the existing path.
+- MMIX wet input/external routing awaits the reverb processor; dry routing, external gain and the core-to-core output chain are implemented. Core mute/SPDIF special modes and master-volume sweep behavior remain incomplete.
 - ADPCM prefetch/end/loop interrupt timing and detailed ADSR/sweep timing need hardware-derived tests. This change preserves the existing scheduling and envelope model.
 - Native/browser audio-device underruns and long-session synchronization need longer playback coverage. WAV captures exercise the emulated mixer rather than the output device.

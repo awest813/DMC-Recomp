@@ -39,8 +39,12 @@ await send('Page.enable');
 if (profileFrom !== null) await send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true });
 if (rest.includes('--nogpu')) await send('Page.addScriptToEvaluateOnNewDocument', { source: "Object.defineProperty(Navigator.prototype, 'gpu', { get: () => undefined, configurable: true });" });
 await send('Page.navigate', { url });
-await new Promise((r) => setTimeout(r, 3000));
-await evaluate(`(() => { const b = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'Start'); if (b) b.click(); return !!b; })()`);
+let started = false;
+for (let attempt = 0; attempt < 150 && !started; ++attempt) {
+  started = await evaluate(`(() => { const b = document.getElementById('start'); if (!b || b.disabled || b.dataset.retry) return false; b.click(); return true; })()`);
+  if (!started) await new Promise((r) => setTimeout(r, 200));
+}
+if (!started) throw new Error('Game did not become ready within 30 seconds');
 const start = Date.now();
 let profiling = false;
 while (Date.now() - start < Number(seconds) * 1000) {
@@ -53,7 +57,7 @@ while (Date.now() - start < Number(seconds) * 1000) {
     }
   }
   await new Promise((r) => setTimeout(r, every));
-  const s = await evaluate(`([...document.body.innerText.matchAll(/frame \\d+[^\\n]*/g)].map((m) => m[0])[0] || '-')`);
+  const s = await evaluate(`document.getElementById('stats')?.textContent || '-'`);
   console.log(((Date.now() - start) / 1000).toFixed(1) + 's ' + s);
 }
 if (profiling) {

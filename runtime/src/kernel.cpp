@@ -415,6 +415,7 @@ bool must_unwind() {
 }
 
 bool in_handler() { return g_in_handler; }
+bool can_save_state() { return !g_in_handler && g_guest_calls.empty(); }
 bool interruptible() { return interrupts_enabled() && !g_in_handler; }
 int current_thread() { return g_current; }
 
@@ -865,7 +866,7 @@ std::function<void()> alarm_action(int id) {
 
 void state(ps2::state::Stream &s) {
     s.tag("eekern");
-    if (s.saving() && (g_in_handler || !g_guest_calls.empty())) throw std::runtime_error("the EE is inside an interrupt handler");
+    if (s.saving() && !can_save_state()) throw std::runtime_error("the EE is inside an interrupt handler");
     s.map(g_threads);
     s.map(g_semas, [&s](Semaphore &v) {
         s.pod(v.count);

@@ -60,6 +60,8 @@ struct Options {
     std::function<void()> on_memcard_saved;
     std::string save_state_path;
     std::uint64_t save_state_frame = 0;
+    std::function<void(bool)> on_state_saved;
+    std::function<void()> on_state_loaded;
 };
 
 extern Options g_options;
@@ -139,6 +141,7 @@ std::uint64_t frames_run();
 std::uint64_t primitives_drawn();
 // pad 0 is the first controller port, pad 1 the second, which starts unplugged
 void set_pad_buttons(std::uint16_t pressed, int pad = 0);
+void set_pad_input(int pad, std::uint16_t buttons, const std::uint8_t axes[4], const std::uint8_t pressure[16]);
 void set_pad_axis(int axis, std::uint8_t value, int pad = 0);
 void set_pad_pressure(int button, std::uint8_t value, int pad = 0);
 void set_pad_connected(int pad, bool connected);

@@ -1,6 +1,6 @@
 # Devil May Cry Port - Handoff
 
-Last updated: 2026-10-21. Branch `dmc-port`.
+Last updated: 2026-10-22. Branch `dmc-port`.
 
 Target: Devil May Cry, NTSC-U (`SLUS_202.16`), disc image at `..\Devil May Cry.iso` (outside the repository).
 
@@ -10,7 +10,7 @@ Devil May Cry plays from a fresh boot through the title, the intro movie, the re
 
 | Area | State |
 |---|---|
-| Native (Windows) | Plays in a window via SDL2 + wgpu-native (WebGPU on D3D12), threaded EE/VU1/GS, 60 fps (paced by audio). Headless runs reach ~85 fps single-threaded. |
+| Native (Windows) | SDL2 + wgpu-native, threaded EE/VU1/GS, nominal 59.94 fields/s with audio-corrected deadlines. Ordinary p95 field intervals ~18–19 ms in a one-minute check. See `docs/NATIVE_STABILITY.md`. |
 | Web (Chrome/Edge) | Builds with Emscripten 6.0.11; Mission 1 holds 60 fps in headless Chrome. Without WebGPU the software renderer takes over at ~10 fps. |
 | Rendering | GPU output is deterministic and pinned by golden frames; the software renderer matches it (mean <= 0.15, p99 <= 1). 1x/2x/3x internal resolution. |
 | Controls | Pad mapping verified against the game's own Controller Setup screen; keyboard remappable (`controls.txt`); arrows drive the left stick. |
@@ -19,11 +19,13 @@ Devil May Cry plays from a fresh boot through the title, the intro movie, the re
 
 ## Play
 
-Double-click **`Play Devil May Cry.bat`** in the repository root. The launcher lets you pick the disc image, memory card, resolution, fullscreen and widescreen, and then:
+Double-click **`Play Devil May Cry.bat`** in the repository root. The launcher has Play, Settings, and Controls & help pages; see [launcher/README.md](launcher/README.md).
 
-- **Play**: native window. **F5** saves a state to `games/dmc/quicksave.ps2`; **F11** toggles fullscreen.
-- **Play in browser**: starts `scripts/serve.py` (stopped when the launcher closes) and opens Chrome/Edge.
-- **Controls...**: edits `games/dmc/controls.txt`, used by both versions.
+- **Play**: select Window or Browser, then Start game. Resume quick save loads the last F5 snapshot in either version. In a window, F5 writes `games/dmc/quicksave.ps2` and F11 toggles fullscreen.
+- **Settings**: disc, window memory card, picture quality and display options. Browser cards are separate; import/export them inside the game. The original localhost browser origin is preserved.
+- **Controls & help**: default controls, a scrolling keyboard editor, and the game log. Settings and mappings carry over from the old launcher.
+- Browser play verifies the local server's disc/build before reuse and stops only a server owned by this launcher. Closing an owned active server asks first.
+- The browser player now has a ready screen, sound toggle, volume, settings and a current keyboard guide. Alt+Enter toggles fullscreen; F remains a right-stick key. Picture changes require Apply & restart. Panels suppress game inputs while open but do not pause the game. See [web/README.md](web/README.md).
 
 Default keys: arrows or I/J/K/L move, S action/jump (Triangle), X sword (Circle), A shoot (Square), Z examine/confirm (Cross), W aim/lock on (R1), Q devil trigger (L1), 1 map (L2), T/F/G/H right stick (devil arm), Enter menu (Start), Backspace options (Select). DMC moves Dante only with the left stick; the D-pad is for menus.
 
@@ -86,8 +88,8 @@ Save states in `games/dmc` (game data; local only). Pass `--frames` as an absolu
 Frame/rendering audit: see [docs/ACCURACY_AUDIT.md](docs/ACCURACY_AUDIT.md). Shared nominal profiles now cover NTSC/PAL interlaced, double-strike and 480p timing, including rational deadlines and delayed GS FIELD updates; see [docs/VIDEO_TIMING.md](docs/VIDEO_TIMING.md). Both renderers handle 24-bit DATE correctly and implement 16-bit dithering. Disc-free checks are available with `-DPS2_BUILD_ACCURACY_TESTS=ON`. Custom video modes and fixed-point interpolation remain open. Golden frames were refreshed for the intended video timing change; the old set remains local.
 
 1. **Combat is untested.** Enemies are story-triggered and the explorer has not met any. The plan is to use an F5 quick-save taken at the first fight.
-2. **Memory card saving is untested.** New cards start unformatted (all 0xFF, as from a factory); DMC should offer to format at its first save point, which has not been reached.
-3. **SPU2 accuracy**: Gaussian interpolation and per-voice dry/wet routing are implemented and tested; see [docs/AUDIO_ACCURACY.md](docs/AUDIO_ACCURACY.md). Reverb, voice noise, pitch modulation, MMIX input/external routing and the core-to-core output chain remain incomplete. New states use version 5 for video events and load versions 2-4. Gaussian history is present from version 4 onward; earlier states initialize it to zero.
+2. **The game's first formatted-card save/load remains untested.** Raw SIO2 card read/write, fresh-process reads, failed-write retries and orderly-exit flushing are tested. New cards start unformatted; DMC should offer to format at its first save point, which has not been reached.
+3. **SPU2 accuracy**: Gaussian interpolation, per-voice buses, MMIX dry routing and the core output chain are implemented; see [docs/AUDIO_ACCURACY.md](docs/AUDIO_ACCURACY.md). Reverb/wet MMIX, voice noise, pitch modulation and detailed envelope timing remain incomplete. New states use version 5 for video events and load versions 2-4. Gaussian history is present from version 4 onward; earlier states initialize it to zero.
 4. **Unconfirmed cutscene effect**: hard-edged rectangular fire patches on Dante in the stabbing cutscene (all resolutions). Possibly correct; needs a hardware or PCSX2 reference.
 5. **Software renderer speed in the browser** (~10 fps; the GS thread is the bottleneck). Only matters without WebGPU.
 6. Without WebGPU the page can log a one-off `requestAdapter` TypeError from WebGPU glue code; the game still runs.
@@ -96,7 +98,7 @@ Frame/rendering audit: see [docs/ACCURACY_AUDIT.md](docs/ACCURACY_AUDIT.md). Sha
 
 1. Load the F5 quick-save from the first fight; check enemy rendering, effects, the HUD gauge (shown during battles) and hit reactions. Add it as a regression case.
 2. Play to the first save point to exercise card formatting and saving, then **Load Data** from the title.
-3. Continue SPU2 accuracy with MMIX/input/external routing, noise/pitch modulation and reverb; Gaussian interpolation and per-voice routing are complete.
+3. Continue SPU2 accuracy with reverb/wet MMIX, noise/pitch modulation and hardware-derived envelope tests. Dry routing and the core output chain are complete.
 4. Compare the questionable cutscene frames with PCSX2.
 
 ## Where things are
@@ -116,6 +118,10 @@ The GPU now carries the earlier software renderer's stable triangle ordering and
 
 ### Latest audio work
 
-Per-voice dry/wet masks now gate all 24 voices independently on both cores; the four voice capture buses saturate before master gain. SPU2 tests: 35,431 assertions. Four gameplay/boot WAVs are byte-identical to the prior mixer output, with no clipping/dropouts, and all nine GPU regressions pass without refreshing frames. MMIX/core chaining and reverb remain open.
+Per-voice dry/wet masks gate all 24 voices independently on both cores; dry MMIX and core-to-core output routing are implemented. SPU2 tests: 37,479 assertions. Four core-routing captures show no clipping/dropouts and differ by at most three sample levels from the preceding routing captures. Reverb/wet MMIX and other detailed SPU2 work remain open; see `docs/AUDIO_ACCURACY.md`.
 
 For the reported scratchy browser startup, the worklet now prebuffers 60 ms at startup/recovery and uses 5 ms fades on starvation/resume. `node scripts/test_web_audio.mjs` tests the actual worklet, including steady PCM, recovery and counter wrap. See `docs/AUDIO_ACCURACY.md` and the latest engineering log entries for validation and limits.
+
+### Native session stability
+
+The native host now prebuffers sound, fades recovery, bounds audio-device stalls and uses continuous mode-derived deadlines with gentle queue correction. Focus loss neutralizes input, sticks have a rescaled deadzone, and the SDL event loop is limited to 250 polls/s. Input publication/serialization is synchronized, and native checkpoint loads immediately reapply live input. F5 reports save completion; resume uses the launcher. Checkpoint/card files use staged replacement, card errors keep pending data for retry, and shutdown flushes dirty cards. Save formats are unchanged. Quick-saving still briefly pauses emulation and can cause one audio recovery; see [docs/NATIVE_STABILITY.md](docs/NATIVE_STABILITY.md).

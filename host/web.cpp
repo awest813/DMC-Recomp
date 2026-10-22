@@ -274,7 +274,7 @@ std::atomic<double> g_emulation_idle{0.0}, g_render_idle{0.0};
 void pace() {
     ps2::post_present();
     if (g_audio.active.load()) {
-        while (audio_queued_ms() > 80.0) usleep(1000);
+        while (g_audio.active.load() && audio_queued_ms() > 80.0) usleep(1000);
         g_next_frame = 0.0;
         return;
     }

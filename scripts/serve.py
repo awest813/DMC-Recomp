@@ -5,12 +5,14 @@ usage: serve.py <build dir> <disc image> [port] [--host address] [--record <dir 
 """
 
 import http.server
+import json
 import os
 import re
 import shutil
 import socket
 import sys
 import threading
+import urllib.parse
 
 RECORD = None
 if '--record' in sys.argv:
@@ -33,17 +35,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
 
     def target(self):
-        path = self.path.split('?', 1)[0]
+        path = urllib.parse.unquote(self.path.split('?', 1)[0])
         if path in ('/', '/index.html'):
             path = '/ps2web.html'
         if path == '/disc.iso':
-            return DISC
+            return DISC if os.path.isfile(DISC) else None
         if path.endswith('/'):
             path += 'index.html'
         name = os.path.normpath(path.lstrip('/'))
         if name.startswith('..') or name == '.':
             return None
-        full = os.path.join(BUILD, name)
+        full = os.path.realpath(os.path.join(BUILD, name))
+        try:
+            if os.path.commonpath((os.path.realpath(BUILD), full)) != os.path.realpath(BUILD):
+                return None
+        except ValueError:
+            return None
         return full if os.path.isfile(full) else None
 
     def headers_for(self, path, length, encoding=None):
@@ -68,6 +75,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.headers_for(path, os.path.getsize(path))
 
     def do_GET(self):
+        if self.path == '/__ps2web_status':
+            data = json.dumps({'application': 'ps2-web-recomp', 'build': BUILD, 'disc': DISC}).encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(data)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
+            self.wfile.write(data)
+            return
         path = self.target()
         if not path:
             self.send_error(404)
@@ -86,6 +102,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if match:
             start = int(match.group(1))
             end = min(int(match.group(2)) if match.group(2) else size - 1, size - 1)
+            if start > end:
+                self.send_response(416)
+                self.send_header('Content-Range', 'bytes */%d' % size)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
             self.send_response(206)
             self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, size))
         else:

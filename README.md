@@ -1,14 +1,12 @@
-# PS2 Web Recomp
+# Devil May Cry Recomp
 
 PlayStation 2 games running in the browser through static recompilation. The game's Emotion Engine machine code is translated ahead of time into C++ and compiled to WebAssembly, so the main CPU is never interpreted; the rest of the console, its operating system and hardware, is emulated by a runtime that draws with WebGPU.
 
-<p align="center">
-  <img src="docs/media/demo.webp" alt="Gran Turismo 4 running in a browser" width="720">
-  <br>
-  <a href="docs/media/demo.mp4">Watch the full recording (1:24)</a>
-</p>
+This branch targets Devil May Cry, NTSC-U (`SLUS_202.16`), with native Windows and browser players. Start with [HANDOFF.md](HANDOFF.md) for setup and current limitations, [launcher/README.md](launcher/README.md) for the launcher, and [docs/NATIVE_STABILITY.md](docs/NATIVE_STABILITY.md) for native pacing and save/load checks. A locally supplied disc and generated game code are required; neither is included.
 
-This is the sibling of [psp-web-recomp](https://github.com/snuri00/psp-web-recomp) and follows the same method. The first title brought up this way is Gran Turismo 4, chosen because it is one of the most demanding games on the system: it leans on both vector units, on exact floating point behaviour for its replays and license tests, and on graphics tricks that read rendered images back as palettes. It plays from boot through the opening movie, the menus and races, with music and sound effects, and saves to a memory card kept in the browser. A race runs at full speed, 50 frames per second for this PAL release, in Chrome on a laptop's integrated GPU at twice the PS2's resolution, which is how the recording above was made.
+## Upstream background
+
+This is the sibling of [psp-web-recomp](https://github.com/snuri00/psp-web-recomp) and follows the same method. The first title brought up this way is Gran Turismo 4, chosen because it is one of the most demanding games on the system: it leans on both vector units, on exact floating point behaviour for its replays and license tests, and on graphics tricks that read rendered images back as palettes. It plays from boot through the opening movie, the menus and races, with music and sound effects, and saves to a memory card kept in the browser. A race runs at full speed, 50 frames per second for this PAL release, in Chrome on a laptop's integrated GPU at twice the PS2's resolution, as reported by the upstream project.
 
 God of War II followed through the same scripts. It needed no game-specific code, but it found two bugs that Gran Turismo 4 had never triggered, one in the recompiler and one in the vector unit timing, and a few missing pieces of the PS2's input/output processor. It now plays from the menus through its cutscenes into combat, and holds 60 frames per second in heavy combat at the PS2's resolution in Chrome. At twice the resolution it runs at 48 to 60, limited by the laptop's integrated GPU.
 
