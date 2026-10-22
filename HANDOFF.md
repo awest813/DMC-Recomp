@@ -31,6 +31,8 @@ Default keys: arrows or I/J/K/L move, S action/jump (Triangle), X sword (Circle)
 
 The native build (with `SDL2.dll` next to `ps2run.exe`) and the web build must exist first; see Build.
 
+GitHub Pages hosts a local ISO/build picker at https://awest813.github.io/DMC-Recomp/. Choose the supported disc and four locally built `ps2web` files; no game artifacts are hosted. Scoped service-worker isolation and bounded local range reads work without a local server. See [web/README.md](web/README.md#github-pages-iso-picker) for deployment and tests.
+
 ## Build
 
 From the repository root, in PowerShell. One-time downloads are already in place here: `third_party/wgpu-native` (v29.0.1.1, windows-x86_64-gnu), `third_party/SDL2-2.32.10` (MinGW devel) and `tools/emsdk` (6.0.11). None of them are committed.

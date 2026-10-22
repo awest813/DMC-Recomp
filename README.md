@@ -4,6 +4,8 @@ PlayStation 2 games running in the browser through static recompilation. The gam
 
 This branch targets Devil May Cry, NTSC-U (`SLUS_202.16`), with native Windows and browser players. Start with [HANDOFF.md](HANDOFF.md) for setup and current limitations, [launcher/README.md](launcher/README.md) for the launcher, and [docs/NATIVE_STABILITY.md](docs/NATIVE_STABILITY.md) for native pacing and save/load checks. A locally supplied disc and generated game code are required; neither is included.
 
+The [GitHub Pages ISO picker](https://awest813.github.io/DMC-Recomp/) opens your local ISO and locally built browser files without a local server. See [browser setup](web/README.md#github-pages-iso-picker); an ISO alone cannot replace the required recompilation build.
+
 ## Upstream background
 
 This is the sibling of [psp-web-recomp](https://github.com/snuri00/psp-web-recomp) and follows the same method. The first title brought up this way is Gran Turismo 4, chosen because it is one of the most demanding games on the system: it leans on both vector units, on exact floating point behaviour for its replays and license tests, and on graphics tricks that read rendered images back as palettes. It plays from boot through the opening movie, the menus and races, with music and sound effects, and saves to a memory card kept in the browser. A race runs at full speed, 50 frames per second for this PAL release, in Chrome on a laptop's integrated GPU at twice the PS2's resolution, as reported by the upstream project.

@@ -11,6 +11,18 @@ Open the game through the launcher in Browser mode. The player has a ready scree
 
 The audio output gain does not alter emulated SPU2 samples. The worklet retains its 60 ms startup/recovery buffer and 5 ms fades. If audio startup fails, gameplay can continue muted and the sound button retries audio initialization.
 
+## GitHub Pages ISO picker
+
+The [hosted launcher](https://awest813.github.io/DMC-Recomp/) accepts a local NTSC-U DMC ISO and the four files from a local browser build: `ps2web.html`, `ps2web.js`, `ps2web.wasm` and `ps2web.data`. Build them with `scripts/build_web.ps1 dmc` first. An ISO alone is insufficient: this project compiles the game ahead of time, and the resulting game code and packaged executable remain local under the repository's publication rules.
+
+The launcher checks the ISO's `SYSTEM.CNF` for `SLUS_202.16` with bounded metadata reads. A service worker serves local file slices to the player, including HTTP byte ranges and the isolation headers required by its threads. It forwards requests to the open launcher tab so disc files survive service worker restarts without copying a multi-gigabyte ISO into browser storage. Files are not uploaded, cached or persisted by the launcher. Reloading requires selecting them again. Closing a game invalidates its session URLs; close the tab to release the selected files.
+
+Pages hosts only the authored static files in `web/pages/`. `.github/workflows/pages.yml` checks disc handling and deploys that directory on changes to `dmc-port` or manual dispatch. Configure the repository's Pages publishing source as **GitHub Actions**. No generated game code, builds, ISO, states or captures are deployed. This uses GitHub's [custom Pages workflow](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages) support.
+
+Use current desktop Chrome or Edge with WebAssembly JSPI; WebGPU is recommended. The worker is scoped to the repository's Pages directory, and its first visit reloads once to enable isolation. Browser cards belong to the origin and are separate from localhost cards. Use the player's memory-card import/export controls to transfer saves.
+
+For a header-free local test, run `python -m http.server 8630 --directory web` and open `http://localhost:8630/pages/`. `node scripts/test_pages.mjs` checks disc validation and range responses without game data. With an isolated Chrome CDP session, run `node scripts/test_pages_browser.mjs <picker-url> <local-iso> <web-build-dir> [cdp-port]` to check isolation, subpath hosting, worker restart, file selection, real gameplay and session cleanup.
+
 ## Checks
 
 `node scripts/test_web_audio.mjs` tests the actual worklet's buffering and sample behavior.
