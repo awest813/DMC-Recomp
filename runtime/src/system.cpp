@@ -88,7 +88,7 @@ void refill(Cpu &c) {
     set_budget(c, slice);
 }
 
-std::uint64_t frame_cycles() { return kEeClock / (g_options.pal ? 50u : 60u); }
+std::uint64_t frame_cycles() { return video_timing().field_cycles(kEeClock, g_frames); }
 
 void dump_frame() {
     std::vector<std::uint32_t> rgba;
@@ -190,7 +190,7 @@ void apply_patches(bool boot) {
     }
 }
 
-void vblank() {
+void vblank(std::uint64_t at) {
     ++g_frames;
     time_frames();
     apply_presses();
@@ -223,9 +223,10 @@ void vblank() {
     }
     if (g_options.trace_iop_modules && g_frames % 25 == 0) std::fprintf(stderr, "[frame] %llu prims %llu\n", static_cast<unsigned long long>(g_frames), static_cast<unsigned long long>(gs::primitives_drawn()));
     if (!g_options.frames_dir.empty() && g_options.frame_every && g_frames % g_options.frame_every == 0 && wanted_frame(g_frames)) dump_frame();
-    hw::vblank_start();
+    const auto timing = video_timing();
+    hw::vblank_start(at);
     iop::vblank(true);
-    schedule(hw::kEventVblankEnd + 100, now() + hblank_cycles() * 22u, [] { iop::vblank(false); });
+    schedule(hw::kEventIopVblankEnd, at + timing.half_lines_cycles(kEeClock, timing.blank_half_lines), [] { iop::vblank(false); });
     kernel::on_vblank_start();
     if (g_options.max_frames && g_frames >= g_options.max_frames) halt("frame limit reached");
     if (g_options.save_state_frame && g_frames == g_options.save_state_frame) g_state_request = true;
@@ -235,7 +236,10 @@ void vblank() {
         g_state_request = true;
         g_state_attempts = 0;
     }
-    schedule(hw::kEventVblank, now() + frame_cycles(), vblank);
+    // Dispatch can run late when a translated EE block overshoots its budget.
+    // Keep the video clock on its deadline instead of accumulating that delay.
+    const std::uint64_t next = at + frame_cycles();
+    schedule(hw::kEventVblank, next, [next] { vblank(next); });
 }
 
 void idle(Cpu &c) {
@@ -277,7 +281,9 @@ void load_context(Cpu &c, const ThreadContext &t) {
 
 std::uint64_t now() { return g_base + static_cast<std::uint64_t>(g_given - g_cpu.budget); }
 
-std::uint64_t hblank_cycles() { return frame_cycles() * 2u / (g_options.pal ? 625u : 525u); }
+VideoTiming video_timing() { return hw::video_timing(); }
+
+std::uint64_t hblank_cycles() { return video_timing().half_lines_cycles(kEeClock, 2); }
 
 void set_budget(Cpu &c, std::int64_t cycles) {
     g_base = now();
@@ -314,11 +320,11 @@ const std::string &halt_reason() { return g_halt_reason; }
 namespace {
 
 constexpr char kStateMagic[8] = {'P', 'S', '2', 'S', 'T', 'A', 'T', 'E'};
-constexpr std::uint32_t kStateVersion = 3;
+constexpr std::uint32_t kStateVersion = 5;
 
 std::function<void()> event_action(int id, std::uint64_t at) {
-    if (id == hw::kEventVblank) return vblank;
-    if (id == hw::kEventVblankEnd + 100) return [] { iop::vblank(false); };
+    if (id == hw::kEventVblank) return [at] { vblank(at); };
+    if (id == hw::kEventIopVblankEnd) return [] { iop::vblank(false); };
     if (id >= hw::kEventCount) return kernel::alarm_action(id - hw::kEventCount);
     return hw::event_action(id, at);
 }
@@ -339,7 +345,7 @@ void machine_state(state::Stream &s) {
     std::uint32_t version = kStateVersion;
     s.pod(version);
     if (std::memcmp(magic, kStateMagic, sizeof magic) != 0) throw std::runtime_error("not a state file");
-    if (version != kStateVersion && !(s.loading() && version == 2)) throw std::runtime_error("state file from another version");
+    if (version != kStateVersion && !(s.loading() && version >= 2 && version <= 4)) throw std::runtime_error("state file from another version");
     s.set_version(version);
     s.tag("ee");
     s.pod(g_cpu);
@@ -353,6 +359,7 @@ void machine_state(state::Stream &s) {
     s.vec(g_events, [&s](Event &e) {
         s.pod(e.id);
         s.pod(e.at);
+        if (s.loading()) e.id = hw::restored_event_id(e.id, s.version());
         if (s.loading()) e.action = event_action(e.id, e.at);
     });
     kernel::state(s);
@@ -367,6 +374,7 @@ void machine_state(state::Stream &s) {
     iop::state(s);
     sif::state(s);
     s.tag("end");
+    if (s.loading() && s.version() < 5) hw::retime_legacy_video();
 }
 
 }
@@ -476,7 +484,8 @@ void boot(std::uint32_t entry, const std::vector<std::string> &args) {
     store<std::uint32_t>(g_ram + argv + 4 * guest_args.size(), 0);
     kernel::start_main_thread(entry, 0, static_cast<std::uint32_t>(guest_args.size()), argv);
     apply_patches(true);
-    schedule(hw::kEventVblank, frame_cycles(), vblank);
+    const std::uint64_t first_vblank = frame_cycles();
+    schedule(hw::kEventVblank, first_vblank, [first_vblank] { vblank(first_vblank); });
 }
 
 int run() {

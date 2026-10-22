@@ -604,3 +604,79 @@ F5 in the native window calls `ps2::request_save_state(path)` (new, thread-safe)
 ### Memory card
 
 The card is emulated at the page level (528-byte pages with ECC), and the disc's own MCMAN/MCSERV drive the filesystem. A new card is all 0xFF (erased, unformatted), as from a factory, which is why the boot warning appears. Changing an option (Vibration OFF) and exiting does not save with an unformatted card; the game keeps defaults, as its warning says. Formatting and saving should happen through the game's own save flow (PS2 games must offer to format); not yet exercised, since the first save point is beyond what the explorer reached.
+
+## 2026-10-21 - Frame scheduling and GS destination-alpha accuracy
+
+The frame/rendering audit is recorded in `docs/ACCURACY_AUDIT.md`. Two generic runtime fixes: vblank now advances from the scheduled deadline (also on state restoration), so late EE blocks cannot accumulate video-clock drift; both renderers ignore DATE on PSMCT24, which has no destination alpha bit. Existing regression captures remain byte-identical on the GPU; golden frames were not refreshed.
+
+All nine game regressions pass on both GPU and software with the stricter RGB channel metric. Software's maximum mean error is 0.13 and p99 is 1 against the GPU goldens.
+
+Added an optional disc-free `ps2_accuracy` CMake target and three CTest cases. It checks late PAL/NTSC field dispatch including save/load, and DATE color/depth behavior across 32/24/16/16S formats. GS checks pass on software and on the Arc A750 GPU at 1x/2x/3x. The screenshot regression metric now measures RGB channels equally instead of luminance; seven Python tests cover that metric and run validation. Missing states, nonzero exits and unknown case filters no longer produce misleading passes. Native and web builds succeed; the web link required a workspace-local temporary directory because the sandbox temporary directory denied writes.
+
+## 2026-10-21 - GS 16-bit dithering
+
+Implemented DIMX/DTHE in the software and compute renderers. The signed 3-bit matrix entries are added to RGB after blending and before final color clamp/wrap and 16-bit conversion, following the stage order in the PCSX2 software renderer. Alpha and 32/24-bit targets are unaffected. GPU setup records now carry both matrix halves; lookup uses native GS coordinates at 1x/2x/3x.
+
+The disc-free rendering harness now has 6,180 assertions per backend, covering matrix position/repetition, signed values and ignored reserved bits, additive/subtractive blending, clamp/wrap, framebuffer masks and alpha preservation. Actual GS-register writes also switch DIMX and DTHE within a single GPU batch to exercise setup generation and record layout. Software and GPU at all three scales pass. All nine isolated GPU game regressions remain identical to the existing goldens; no goldens were refreshed.
+
+Concurrent GPU/software regressions initially shared an output directory, deleting one GPU screenshot. Added `dmc_regress.py --out <directory>` and a Python check for it; the isolated GPU rerun passes all nine cases. Use separate output directories for parallel renderer runs.
+
+Final validation: all nine software cases also pass (maximum mean 0.13, p99 1 against GPU goldens), eight Python tests pass, and the web build succeeds. A 20-second headless Chrome smoke test loaded the gameplay state at frame 17000 and reached 17926, presenting through WebGPU without console exceptions; final samples were 60 fps, with startup warmup and one transient dip. The sandbox blocked the localhost debugging connection, so the browser check ran outside the sandbox. No game output was committed or published.
+
+## 2026-10-21 - SPU2 Gaussian voice interpolation
+
+Replaced linear ADPCM voice resampling with the literal 512-entry hardware coefficient table documented by nocash. All 256 phase rows match the PCSX2 SPU2 table exactly. The filter uses pitch bits 4-11 and shifts each signed product before adding. Three prior decoded samples now follow each voice across block and loop boundaries and reset on key-on; streamed AutoDMA PCM bypasses the filter. The implementation and remaining audio gaps are described in `docs/AUDIO_ACCURACY.md`.
+
+State format 4 stores the filter history separately, preserving the existing raw voice layout. Versions 2/3 still load, initializing absent history to zero. This may cause a short transition at a legacy state's block boundary; version 4 round trips preserve the output exactly.
+
+Added `ps2_spu2_accuracy` to the optional accuracy targets and CTest: 10,457 assertions cover coefficients/phase vectors, rounding, both cores, pitch extremes, ADPCM loop boundaries, stereo gain, key-on reset, exact save/load, deterministic legacy migration, PCM bypass and sample counts. Four before/after game audio clips have identical sample counts and no clipping or detected dropouts. The movie portion after 20 seconds is byte-identical. Energy above 16 kHz drops by about 5 dB in the shop and 13 dB in the gameplay-actions clip; this supports the expected filtering change without claiming a hardware match. All nine game screenshot regressions pass unchanged.
+
+Native and web builds succeed. The final headless Chrome smoke test loaded a version 3 gameplay state and reached frame 17954 without exceptions, ending at 60 fps with 58 ms queued audio after startup and transient dips. This validates browser execution/buffering; physical-device and long-session audio testing remain open.
+
+## 2026-10-21 - Shared video rates and blanking
+
+Added `ps2/video.hpp` with nominal profiles based on PCSX2's PS2-test-based counter model: NTSC/PAL interlaced, analog double-strike and 480p. Core field scheduling and native/browser fallback pacing share the same rate. Field deadlines carry fractional EE cycles through the saved field index; HBlank-clock counters and scanline alarms use rational conversions. Mode changes preserve integer counter values, reschedule counter targets and update SMODE2. Unsupported/custom video timings remain explicit fallbacks; see `docs/VIDEO_TIMING.md` for the profile values and limits.
+
+EE/IOP blank ends are scheduled from the original blank-start deadline, using mode-dependent widths instead of 22 rounded lines. GS FIELD/VSINT changes occur at a separate delayed edge. State format 5 reserves the additional events, migrates versions 2-4 event IDs/alarms, and retimes old HBlank counters while preserving their legacy counts so target IRQs are not missed. The pending field boundary is retained when loading an old state.
+
+Seven CTest targets pass, including five video profiles with 100,000-field sums, exact blank/GS edges, late dispatch, HBlank IRQs, mode switches, forced-region behavior, pending-GS save/load and legacy migration, plus the GS and SPU2 tests. Old/new screenshots for all eleven captures across nine cases were reviewed. Goldens were intentionally refreshed for changed field/animation sampling, with `games/dmc/golden-before-video-timing` preserving the prior set locally. Four audio captures at the new rate have no clipping/dropouts; sample counts scale with field duration while output stays at 48 kHz.
+
+Strengthened pending-edge restoration by advancing past blank end before reloading the saved pre-GS-edge state. This exposed the unsaved guest-visible INTC latch; version 5 now stores it, with legacy snapshots initializing it from pending status. All seven CTest targets pass, including the rewind check. Older HBlank counter targets are also rescheduled from preserved counts during migration.
+
+Final GPU game rerun: 9/9, all screenshots identical to the refreshed timing goldens. Native/web builds succeed. Headless Chrome loaded a version 3 state and reached frame 18011 without exceptions; final status was 60 fps with 79 ms queued audio, after startup and a transient dip. The full software suite passed before the final latch-persistence change; the final software recheck covers the other eight cases, while the long cutscene is covered by GPU and the independent state-edge tests.
+
+The final targeted software rerun passed 8/8, with maximum mean 0.12 and p99 1 against the reviewed timing goldens. The final code has 7/7 CTest targets, 9/9 GPU game cases, and the Chrome smoke check passing. The earlier complete software run was 9/9; the long cutscene was not repeated after the final latch-only adjustment.
+
+## 2026-10-21 - Preview, mipmaps and recurring GPU speckles
+
+Opened a persistent localhost preview on port 8620. The final pending software shop check from the timing work passed (mean 0.07/0.13, p99 1), completing coverage of all nine timing cases on the final latch code.
+
+The user reported sparkling stone/bridge textures and supplied a torch-corridor screenshot, then pointed out an earlier agent had fixed this. The existing log's "Software renderer speckles (fixed)" section identifies constant alpha rounding below AREF 128 and order-dependent interpolation. That protection existed only in the software path. GPU triangles now use the same canonical vertex order, preserving the original flat-shading provoking vertex, and GPU triangle/line attributes use an anchor plus differences so constant colors and Q remain exact. Reproduced the user's corridor from `games/dmc/explore/step04_ldown.ps2`; the browser view at 3x no longer shows the regular bright/dark stipple pattern. The preview remains available as `?state=sparkle-corridor.ps2` (local copied checkpoint only).
+
+Separately, the bridge primitive trace exposed active explicit mipmaps: TEX1 FFFFFF3D00000124, nonzero MIPTBP1, and positive LOD on many vertices. Both renderers had ignored mipmaps entirely. Implemented explicit levels 0-6, signed K and dynamic Q/constant LOD, min/mag filtering, nearest mip selection and trilinear blending, coordinate/dimension/region scaling, and GPU mip-range hazards. Added TEX1/mip registers to primitive traces. Host floating-point LOD/filter weights and absent automatic MTBA address generation remain limitations.
+
+Seven CTest targets pass. The GS target has 6,307 software checks and 6,308 GPU checks, including 120 mip combinations, six spatial filter ramps, constant-alpha and reordered coplanar passes across every scale layer. Final GPU checks passed at 1x/3x; initial mip/ramp checks also passed at 2x. Native/web builds pass. A preview navigation during linking briefly mixed old JS and new wasm; reloading after the completed build resolved it.
+
+Full GPU and software game runs reached every frame limit with no runtime/check failures, but five screenshot cases correctly differed from the old level-zero goldens. Reviewed all eleven old/new captures and backed up goldens to `games/dmc/golden-before-mipmapping` before intentionally recording the new set. The record run passes 9/9. The five changed software captures compare against final GPU images with maximum mean 0.091 and p99 1. The unchanged software shop capture remains mean 0.13/p99 1.
+Final independent GPU verification against the refreshed goldens passes 9/9, all eleven captures byte-identical. No additional reference refresh was needed.
+
+## 2026-10-21 - SPU2 per-voice dry/wet routing
+
+The VMIXL/VMIXR/VMIXEL/VMIXER masks were stored in the register shadow but ignored by rendering. Each of 24 voices now contributes independently to four dry/wet channel sums on each core. Muting a bus does not stop decoding, envelope/volume advancement or raw voice capture. Each voice sum saturates to signed 16-bit before master gain, and wet capture rings now contain the routed pre-MMIX voice samples instead of zeros. Register addresses, bus saturation/stage order and initial masks were checked against PCSX2's SPU2 register map, mixer and reference initialization. See `docs/AUDIO_ACCURACY.md` for links and limits.
+
+No state version/layout change: all four masks were already saved in `Core::regs`; loaded masks are used directly. Reset initializes the 24 valid bits of each mask to the reference defaults.
+
+The SPU2 test target now has 35,431 assertions, including both cores; voices 0, 15, 16 and 23; all 16 gate combinations; stereo output and all four voice capture buses; muted progression; saved routed output; wet-ring IRQA; bus saturation; and raw voice capture. Seven CTest targets pass. All nine GPU game regressions pass with byte-identical images and no golden refresh.
+
+Four mixer WAV captures remain local in `games/dmc/audio-accuracy/voice-routing`: fresh boot/title/movie (1,520,704 stereo frames), shop (481,280), gameplay jump/gun/sword (321,120), and castle hall (481,280), all at 48 kHz. Every sample is byte-identical to the prior video-timing capture set, with zero clipped samples or detected dropouts. DMC's tested routing therefore remains audible exactly as before; synthetic tests establish the newly functional bus controls. This does not validate physical audio-device output or establish hardware-exact reverb.
+
+Remaining: MMIX input/external dry/wet gates and the actual core-to-core output chain, reverb processing/return, voice noise/pitch modulation, and detailed ADPCM/ADSR/sweep timing. The existing PCM and host-output paths were preserved.
+
+The voice-routing web build passed. A separate 20-second headless Chrome run loaded frame 17000 and reached 17772 without console exceptions, ending at about 60 fps with 73 ms queued audio. Startup showed repeated near-empty queues before stabilizing; the user's live preview was left alone.
+
+### Browser scratchy startup report
+
+The user reported very scratchy sound at the beginning. Inspection found immediate consumption of any producer samples, exponential holding/decay on starvation, and no fade when PCM resumed. Added 60 ms startup/recovery prebuffering and 5 ms fades to silence/back in, with unsigned queue distance for counter wrap. The host's 80 ms pacing target and the emulated PCM are unchanged. This targets audible discontinuities from warmup starvation; sustained inability to run in real time can still cause pauses.
+
+Added `scripts/test_web_audio.mjs`, which executes the actual page worklet against a deterministic producer and tests silent prebuffering, preserved queue contents, unchanged steady samples, partial-quantum starvation/fade, recovery, stereo, active pacing and 32-bit wrap. Tests pass. Browser rebuild/playback validation follows below.
+The startup-buffering web rebuild passed. The final 20-second headless check reached frame 17877 without console exceptions and ended with 74 ms queued audio; startup and competing preview work still caused transient frame-rate dips. The visible 3x corridor preview was reloaded and started with the new worklet. Physical listening remains the user-facing check; buffering/fades cannot prevent pauses under sustained real-time overload.

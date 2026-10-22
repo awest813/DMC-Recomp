@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ps2/cpu.hpp"
+#include "ps2/video.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -32,10 +33,20 @@ enum Event {
     kEventTimer3,
     kEventDma0,
     kEventIop = kEventDma0 + 10,
+    kEventGsVblank,
+    kEventIopVblankEnd,
     kEventCount
 };
 
-void vblank_start();
+constexpr int restored_event_id(int id, std::uint32_t version) {
+    if (version >= 5) return id;
+    if (id == 101) return kEventIopVblankEnd; // Legacy out-of-range IOP vblank event.
+    return id >= 17 ? id + 2 : id; // Old alarm base was 17.
+}
+
+VideoTiming video_timing();
+void retime_legacy_video();
+void vblank_start(std::uint64_t at);
 std::uint32_t intc_pending();
 void intc_raise(unsigned cause);
 void intc_ack(unsigned cause);

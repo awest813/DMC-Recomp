@@ -813,7 +813,7 @@ void write_privileged(std::uint32_t address, std::uint64_t value) {
 
 void vblank(bool start) {
     if (start) {
-        g_odd_field = !g_odd_field;
+        g_odd_field = video_timing().interlaced ? !g_odd_field : false;
         raise(8);
         if (queue::active()) queue::post(queue::kVblank, 0, 0, nullptr, 0);
 #ifdef PS2_GPU

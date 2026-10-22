@@ -83,9 +83,11 @@ Save states in `games/dmc` (game data; local only). Pass `--frames` as an absolu
 
 ## Open issues
 
+Frame/rendering audit: see [docs/ACCURACY_AUDIT.md](docs/ACCURACY_AUDIT.md). Shared nominal profiles now cover NTSC/PAL interlaced, double-strike and 480p timing, including rational deadlines and delayed GS FIELD updates; see [docs/VIDEO_TIMING.md](docs/VIDEO_TIMING.md). Both renderers handle 24-bit DATE correctly and implement 16-bit dithering. Disc-free checks are available with `-DPS2_BUILD_ACCURACY_TESTS=ON`. Custom video modes and fixed-point interpolation remain open. Golden frames were refreshed for the intended video timing change; the old set remains local.
+
 1. **Combat is untested.** Enemies are story-triggered and the explorer has not met any. The plan is to use an F5 quick-save taken at the first fight.
 2. **Memory card saving is untested.** New cards start unformatted (all 0xFF, as from a factory); DMC should offer to format at its first save point, which has not been reached.
-3. **SPU2 interpolation**: voices are resampled linearly (`runtime/src/iop/spu2.cpp` `render_voice`); the hardware uses a 4-tap Gaussian filter with a 512-entry ROM table. Needs the exact table from a trusted reference.
+3. **SPU2 accuracy**: Gaussian interpolation and per-voice dry/wet routing are implemented and tested; see [docs/AUDIO_ACCURACY.md](docs/AUDIO_ACCURACY.md). Reverb, voice noise, pitch modulation, MMIX input/external routing and the core-to-core output chain remain incomplete. New states use version 5 for video events and load versions 2-4. Gaussian history is present from version 4 onward; earlier states initialize it to zero.
 4. **Unconfirmed cutscene effect**: hard-edged rectangular fire patches on Dante in the stabbing cutscene (all resolutions). Possibly correct; needs a hardware or PCSX2 reference.
 5. **Software renderer speed in the browser** (~10 fps; the GS thread is the bottleneck). Only matters without WebGPU.
 6. Without WebGPU the page can log a one-off `requestAdapter` TypeError from WebGPU glue code; the game still runs.
@@ -94,7 +96,7 @@ Save states in `games/dmc` (game data; local only). Pass `--frames` as an absolu
 
 1. Load the F5 quick-save from the first fight; check enemy rendering, effects, the HUD gauge (shown during battles) and hit reactions. Add it as a regression case.
 2. Play to the first save point to exercise card formatting and saving, then **Load Data** from the title.
-3. Replace linear SPU2 interpolation with the Gaussian table from a verified source.
+3. Continue SPU2 accuracy with MMIX/input/external routing, noise/pitch modulation and reverb; Gaussian interpolation and per-voice routing are complete.
 4. Compare the questionable cutscene frames with PCSX2.
 
 ## Where things are
@@ -107,3 +109,13 @@ Save states in `games/dmc` (game data; local only). Pass `--frames` as an absolu
 - `scripts/` - build, serve, test and analysis scripts (see Test).
 - `generated/dmc/` - generated game code; never hand-edit. `games/dmc/` - local game data, logs, states, golden frames.
 - `AGENTS.md` - rules and the full debugging reference. `ENGINEERING_LOG.md` - how each problem was found and fixed. `PROGRESS_PLAN.md` - phases and remaining checks.
+
+### Latest preview / surface speckles
+
+The GPU now carries the earlier software renderer's stable triangle ordering and preserves constant interpolated colors exactly, fixing the regular stone-surface dots reproduced in the torch corridor at 3x. Explicit mip levels and minification filtering are implemented on both renderers; see `docs/ACCURACY_AUDIT.md`. Goldens were intentionally refreshed and the old set is retained as `games/dmc/golden-before-mipmapping`. Local preview: `http://127.0.0.1:8620/ps2web.html?state=sparkle-corridor.ps2`. Source checkpoint is `games/dmc/explore/step04_ldown.ps2`; no game data is tracked. Automatic MTBA chains and hardware-exact LOD/filter precision remain open.
+
+### Latest audio work
+
+Per-voice dry/wet masks now gate all 24 voices independently on both cores; the four voice capture buses saturate before master gain. SPU2 tests: 35,431 assertions. Four gameplay/boot WAVs are byte-identical to the prior mixer output, with no clipping/dropouts, and all nine GPU regressions pass without refreshing frames. MMIX/core chaining and reverb remain open.
+
+For the reported scratchy browser startup, the worklet now prebuffers 60 ms at startup/recovery and uses 5 ms fades on starvation/resume. `node scripts/test_web_audio.mjs` tests the actual worklet, including steady PCM, recovery and counter wrap. See `docs/AUDIO_ACCURACY.md` and the latest engineering log entries for validation and limits.

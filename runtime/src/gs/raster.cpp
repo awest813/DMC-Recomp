@@ -24,11 +24,13 @@ struct Setup {
     std::uint32_t aref;
     int a, b, c, d;
     std::uint32_t fix;
-    bool pabe, colclamp, fba;
+    bool pabe, colclamp, fba, dthe;
+    std::uint64_t dimx;
     int scax0, scax1, scay0, scay1;
     int ofx, ofy;
     std::uint32_t tbp, tbw, tpsm, tw, th, cpsm, csa;
     bool tcc, bilinear;
+    std::uint64_t tex1, miptbp[2];
     int tfx, wms, wmt;
     std::uint32_t minu, maxu, minv, maxv;
     std::uint32_t ta0, ta1;
@@ -81,7 +83,7 @@ std::uint32_t fetch(const Setup &s, int x, int y) {
     }
 }
 
-std::uint32_t sample(const Setup &s, float u, float v) {
+std::uint32_t sample_level(const Setup &s, float u, float v) {
     if (!s.bilinear) return fetch(s, static_cast<int>(std::floor(u)), static_cast<int>(std::floor(v)));
     u -= 0.5f;
     v -= 0.5f;
@@ -94,6 +96,46 @@ std::uint32_t sample(const Setup &s, float u, float v) {
         const float c = static_cast<float>((c01 >> ch) & 0xFFu), d = static_cast<float>((c11 >> ch) & 0xFFu);
         const float top = a + (b - a) * fx, bottom = c + (d - c) * fx;
         out |= static_cast<std::uint32_t>(std::clamp(top + (bottom - top) * fy + 0.5f, 0.0f, 255.0f)) << ch;
+    }
+    return out;
+}
+
+std::uint32_t sample(const Setup &s, float u, float v, float q) {
+    const unsigned mxl = std::min<unsigned>((s.tex1 >> 2) & 7u, 6u);
+    if (!mxl) return sample_level(s, u, v);
+    const unsigned mmin = (s.tex1 >> 6) & 7u;
+    const int bias = static_cast<int>(((s.tex1 >> 32) & 0xFFFu) ^ 0x800u) - 0x800;
+    float lod = static_cast<float>(bias) / 16.0f;
+    if (!(s.tex1 & 1u) && !s.fst)
+        lod -= std::log2(std::max(std::abs(q), 1.0e-30f)) * static_cast<float>(1u << ((s.tex1 >> 19) & 3u));
+    if (lod <= 0) return sample_level(s, u, v);
+    Setup level = s;
+    level.bilinear = mmin == 1 || mmin >= 4;
+    if (mmin < 2) return sample_level(level, u, v);
+    lod = std::min(lod, static_cast<float>(mxl));
+    const bool trilinear = mmin & 1u;
+    const unsigned first = static_cast<unsigned>(std::floor(lod + (trilinear ? 0.0f : 0.5f)));
+    const auto at_level = [&](unsigned n) {
+        Setup t = level;
+        if (n) {
+            const auto descriptor = s.miptbp[(n - 1) / 3] >> (((n - 1) % 3) * 20);
+            t.tbp = descriptor & 0x3FFFu;
+            t.tbw = (descriptor >> 14) & 0x3Fu;
+            t.tw = s.tw > n ? s.tw - n : 0;
+            t.th = s.th > n ? s.th - n : 0;
+            t.minu >>= n; t.maxu >>= n; t.minv >>= n; t.maxv >>= n;
+        }
+        const float scale = static_cast<float>(1u << n);
+        return sample_level(t, u / scale, v / scale);
+    };
+    const auto a = at_level(first);
+    if (!trilinear || first == mxl) return a;
+    const auto b = at_level(first + 1);
+    const float fraction = lod - static_cast<float>(first);
+    std::uint32_t out = 0;
+    for (unsigned ch = 0; ch < 32; ch += 8) {
+        const float av = (a >> ch) & 255u, bv = (b >> ch) & 255u;
+        out |= static_cast<std::uint32_t>(av + (bv - av) * fraction + 0.5f) << ch;
     }
     return out;
 }
@@ -167,7 +209,7 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
             u = at.s / q * static_cast<float>(1 << s.tw);
             v = at.t / q * static_cast<float>(1 << s.th);
         }
-        const std::uint32_t t = sample(s, u, v);
+        const std::uint32_t t = sample(s, u, v, at.q);
         const int tr = static_cast<int>(t & 0xFFu), tg = static_cast<int>((t >> 8) & 0xFFu), tb = static_cast<int>((t >> 16) & 0xFFu), ta = static_cast<int>(t >> 24);
         switch (s.tfx) {
         case 0:
@@ -241,10 +283,11 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
 
     std::uint32_t dst = 0;
     bool have_dst = false;
-    if (s.date) {
+    // PSMCT24 has no destination alpha bit; DATE is ignored for this format.
+    if (s.date && s.fpsm != PSMCT24) {
         dst = read_frame(s, x, y);
         have_dst = true;
-        const bool bit = (s.fpsm == PSMCT16 || s.fpsm == PSMCT16S) ? (dst & 0x80000000u) != 0 : (dst & 0x80000000u) != 0;
+        const bool bit = (dst & 0x80000000u) != 0;
         if (bit != s.datm) return;
     }
 
@@ -273,16 +316,23 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
                 const int bv = s.b == 0 ? cs[i] : s.b == 1 ? cd[i] : 0;
                 const int dv = s.d == 0 ? cs[i] : s.d == 1 ? cd[i] : 0;
                 const int v = (((av - bv) * cc) >> 7) + dv;
-                out[i] = s.colclamp ? clamp255(v) : (v & 0xFF);
+                out[i] = v;
             }
             r = out[0];
             g = out[1];
             b = out[2];
-        } else if (!s.colclamp) {
-            r &= 0xFF;
-            g &= 0xFF;
-            b &= 0xFF;
         }
+        if (s.dthe && (s.fpsm == PSMCT16 || s.fpsm == PSMCT16S)) {
+            // DIMX entries are signed 3-bit values in 4-bit slots, indexed in native GS coordinates.
+            const unsigned shift = static_cast<unsigned>(((y & 3) * 4 + (x & 3)) * 4);
+            const int dither = (static_cast<int>((s.dimx >> shift) & 7u) ^ 4) - 4;
+            r += dither;
+            g += dither;
+            b += dither;
+        }
+        r = s.colclamp ? clamp255(r) : (r & 0xFF);
+        g = s.colclamp ? clamp255(g) : (g & 0xFF);
+        b = s.colclamp ? clamp255(b) : (b & 0xFF);
         std::uint32_t out_a = static_cast<std::uint32_t>(a & 0xFF);
         if (s.fba) out_a |= 0x80u;
         std::uint32_t mask = s.fbmsk;
@@ -330,6 +380,8 @@ Setup make_setup(const State &st) {
     s.fix = static_cast<std::uint32_t>(c.alpha >> 32) & 0xFFu;
     s.pabe = st.pabe & 1u;
     s.colclamp = st.colclamp & 1u;
+    s.dthe = st.dthe & 1u;
+    s.dimx = st.dimx;
     s.fba = c.fba & 1u;
     s.scax0 = static_cast<int>(c.scissor & 0x7FFu);
     s.scax1 = static_cast<int>((c.scissor >> 16) & 0x7FFu);
@@ -347,6 +399,9 @@ Setup make_setup(const State &st) {
     s.cpsm = static_cast<std::uint32_t>(c.tex0 >> 51) & 0xFu;
     s.csa = static_cast<std::uint32_t>(c.tex0 >> 56) & 0x1Fu;
     s.bilinear = (c.tex1 >> 5) & 1u;
+    s.tex1 = c.tex1;
+    s.miptbp[0] = c.miptbp1;
+    s.miptbp[1] = c.miptbp2;
     s.wms = static_cast<int>(c.clamp) & 3;
     s.wmt = static_cast<int>(c.clamp >> 2) & 3;
     s.minu = static_cast<std::uint32_t>(c.clamp >> 4) & 0x3FFu;
@@ -532,6 +587,10 @@ void draw(const State &st, const Vertex *v, int count) {
                          "[prim] %llu abe %d fst %d zte %d ztst %d afail %d fbmsk %08X scissor %d %d %d %d ofs %d %d\n",
                          static_cast<unsigned long long>(n), s.abe, s.fst, s.zte, s.ztst, s.afail, s.fbmsk,
                          s.scax0, s.scax1, s.scay0, s.scay1, s.ofx, s.ofy);
+            const Context &context = st.ctx[(st.prmodecont & 1u ? st.prim : st.prmode) >> 9 & 1u];
+            std::fprintf(stderr, "[prim] %llu tex1 %016llX mip1 %016llX mip2 %016llX bilinear %d\n",
+                         static_cast<unsigned long long>(n), static_cast<unsigned long long>(context.tex1),
+                         static_cast<unsigned long long>(context.miptbp1), static_cast<unsigned long long>(context.miptbp2), s.bilinear);
             for (int i = 0; i < count; ++i)
                 std::fprintf(stderr, "[prim] %llu v%d %08X %08X z %08X st %.6f %.6f q %.6f rgba %02X%02X%02X%02X uv %04X %04X\n",
                              static_cast<unsigned long long>(n), i, v[i].x, v[i].y, v[i].z, v[i].s, v[i].t, v[i].q,

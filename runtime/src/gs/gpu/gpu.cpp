@@ -37,7 +37,7 @@ constexpr std::uint32_t kParamStride = 256;
 constexpr std::uint32_t kClutSlots = 2048;
 constexpr std::uint32_t kClutEntries = 512;
 constexpr std::uint32_t kPrimWords = 28;
-constexpr std::uint32_t kSetupWords = 25;
+constexpr std::uint32_t kSetupWords = 35;
 constexpr std::uint32_t kDecodedWords = 4u << 20;
 constexpr std::uint32_t kDecodePrims = 64;
 
@@ -393,6 +393,7 @@ void add_spans(const std::uint32_t *rec, std::uint32_t lo, std::uint32_t hi) {
 }
 
 bool reads_own_word(const std::uint32_t *rec, const std::uint32_t *setup) {
+    if ((setup[27] >> 2) & 7u) return false;
     const std::uint32_t fpsm = setup[3], tpsm = setup[14];
     if (rec[1] != 1 || (setup[0] & (16u | 16384u)) != 16u || setup[12] != setup[1] || setup[13] != setup[2]) return false;
     float f[6], uv[6];
@@ -502,7 +503,15 @@ std::uint32_t snapshot_batch(std::uint32_t prims, std::uint32_t &lo, std::uint32
         const std::uint32_t *setup = b.setups.data() + rec[0] * kSetupWords;
         if (!(setup[0] & 2u) || reads_own_word(rec, setup)) continue;
         const int tw = std::max(1 << (setup[15] & 0xFFu), static_cast<int>(setup[18] >> 16) + 1), th = std::max(1 << (setup[15] >> 8), static_cast<int>(setup[19] >> 16) + 1);
-        const Range t = read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
+        Range t = read_range(rec, setup, region(setup[12], setup[13], setup[14], 0, 0, tw - 1, th - 1));
+        if (((setup[27] >> 6) & 7u) >= 2) {
+            for (unsigned level = 1; level <= std::min<unsigned>((setup[27] >> 2) & 7u, 6u); ++level) {
+                const auto descriptor = setup[28 + level];
+                const Range mip = region(descriptor & 0x3FFFu, descriptor >> 14, setup[14], 0, 0,
+                                         std::max(1, tw >> level) - 1, std::max(1, th >> level) - 1);
+                t.add(mip.lo, mip.hi);
+            }
+        }
         for (const Range *w : {&fb, b.zwrite ? &z : nullptr})
             if (w && t.overlaps(w->lo, w->hi)) shared.add(std::max(t.lo, w->lo), std::min(t.hi, w->hi));
     }
@@ -979,7 +988,8 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     if (attr & 0x100u) flags |= 16u;
     if ((c.zbuf >> 32) & 1u) flags |= 32u;
     if (c.test & 1u) flags |= 64u;
-    if ((c.test >> 14) & 1u) flags |= 128u;
+    // Destination alpha testing is disabled on 24-bit framebuffers.
+    if (((c.test >> 14) & 1u) && ((c.frame >> 24) & 0x3Fu) != PSMCT24) flags |= 128u;
     if ((c.test >> 15) & 1u) flags |= 256u;
     if ((c.test >> 16) & 1u) flags |= 512u;
     if (st.pabe & 1u) flags |= 1024u;
@@ -988,6 +998,7 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     if ((c.tex0 >> 34) & 1u) flags |= 8192u;
     if ((c.tex1 >> 5) & 1u) flags |= 16384u;
     if ((st.texa >> 15) & 1u) flags |= 32768u;
+    if (st.dthe & 1u) flags |= 65536u;
     const std::uint32_t zpsm = 0x30u | (static_cast<std::uint32_t>(c.zbuf >> 24) & 0xFu);
     w[0] = flags;
     w[1] = (static_cast<std::uint32_t>(c.frame) & 0x1FFu) * 32u;
@@ -1017,6 +1028,12 @@ std::uint32_t make_setup(const State &st, std::uint64_t attr, std::uint32_t *w) 
     w[22] = g_clut_slot;
     w[23] = z_max(zpsm);
     w[24] = 0xFFFFFFFFu;
+    w[25] = static_cast<std::uint32_t>(st.dimx);
+    w[26] = static_cast<std::uint32_t>(st.dimx >> 32);
+    w[27] = static_cast<std::uint32_t>(c.tex1);
+    w[28] = static_cast<std::uint32_t>(c.tex1 >> 32) & 0xFFFu;
+    for (unsigned level = 0; level < 6; ++level)
+        w[29 + level] = static_cast<std::uint32_t>((level < 3 ? c.miptbp1 : c.miptbp2) >> ((level % 3) * 20)) & 0xFFFFFu;
     return flags;
 }
 
@@ -1270,6 +1287,15 @@ void draw(const State &st, const Vertex *v, int count) {
             const std::uint32_t tw = w[15] & 0xFFu, th = w[15] >> 8;
             const int tex_w = std::max(1 << tw, static_cast<int>(w[18] >> 16) + 1), tex_h = std::max(1 << th, static_cast<int>(w[19] >> 16) + 1);
             cache.tex = region(w[12], w[13], w[14], 0, 0, tex_w - 1, tex_h - 1);
+            if (((w[27] >> 6) & 7u) >= 2) {
+                const unsigned mxl = std::min<unsigned>((w[27] >> 2) & 7u, 6u);
+                for (unsigned level = 1; level <= mxl; ++level) {
+                    const auto descriptor = w[28 + level];
+                    const Range mip = region(descriptor & 0x3FFFu, descriptor >> 14, w[14], 0, 0,
+                                             std::max(1, tex_w >> level) - 1, std::max(1, tex_h >> level) - 1);
+                    cache.tex.add(mip.lo, mip.hi);
+                }
+            }
         }
     }
     const std::uint32_t *setup = cache.setup;
@@ -1288,6 +1314,13 @@ void draw(const State &st, const Vertex *v, int count) {
     switch (prim) {
     case 3: case 4: case 5: {
         if (count < 3) return;
+        const Vertex flat = v[2];
+        Vertex sorted[3] = {v[0], v[1], v[2]};
+        const auto before = [](const Vertex &a, const Vertex &b) { return a.y != b.y ? a.y < b.y : a.x < b.x; };
+        if (before(sorted[1], sorted[0])) std::swap(sorted[0], sorted[1]);
+        if (before(sorted[2], sorted[1])) std::swap(sorted[1], sorted[2]);
+        if (before(sorted[1], sorted[0])) std::swap(sorted[0], sorted[1]);
+        v = sorted;
         const float x0 = sx(v[0]), y0 = sy(v[0]), x1 = sx(v[1]), y1 = sy(v[1]), x2 = sx(v[2]), y2 = sy(v[2]);
         const float area = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0);
         if (area == 0.0f) return;
@@ -1305,7 +1338,7 @@ void draw(const State &st, const Vertex *v, int count) {
             return gx > 0.0f || (gx == 0.0f && gy > 0.0f);
         };
         rec[27] = (inclusive(x1, y1, x2, y2) ? 1u : 0u) | (inclusive(x2, y2, x0, y0) ? 2u : 0u) | (inclusive(x0, y0, x1, y1) ? 4u : 0u);
-        for (int i = 0; i < 3; ++i) attrs(rec, i, v[i], fst, iip ? nullptr : &v[2]);
+        for (int i = 0; i < 3; ++i) attrs(rec, i, v[i], fst, iip ? nullptr : &flat);
         rec[24] = v[0].z;
         rec[25] = f2u(static_cast<float>(static_cast<std::int64_t>(v[1].z) - static_cast<std::int64_t>(v[0].z)));
         rec[26] = f2u(static_cast<float>(static_cast<std::int64_t>(v[2].z) - static_cast<std::int64_t>(v[0].z)));
@@ -1378,7 +1411,7 @@ void draw(const State &st, const Vertex *v, int count) {
             const auto written = [&](const Range &t) { return t.overlaps(b.fb_range.lo, b.fb_range.hi) || (b.zwrite && t.overlaps(b.z_range.lo, b.z_range.hi)); };
             int rect[4];
             if (written(tex)) {
-                if (!texel_rect(setup, v, count, prim, fst, rect)) {
+                if ((((setup[27] >> 2) & 7u) && ((setup[27] >> 6) & 7u) >= 2) || !texel_rect(setup, v, count, prim, fst, rect)) {
                     emit_all();
                 } else {
                     const Range used = region(setup[12], setup[13], setup[14], rect[0], rect[1], rect[2], rect[3]);

@@ -56,23 +56,32 @@ std::uint64_t timer_divider(const Timer &t) {
     }
 }
 
+std::uint64_t timer_ticks(const Timer &t, std::uint64_t at) {
+    return (t.mode & 3u) == 3 ? ps2::video_timing().scanlines_elapsed(kEeClock, at - t.base) : (at - t.base) / timer_divider(t);
+}
+
+std::uint64_t timer_at(const Timer &t, std::uint64_t ticks) {
+    return t.base + ((t.mode & 3u) == 3 ? ps2::video_timing().cycles_for_scanlines(kEeClock, ticks) : ticks * timer_divider(t));
+}
+
 std::uint32_t timer_count(int n) {
     const Timer &t = g_timers[n];
     if (!(t.mode & 0x80u)) return t.frozen;
-    return static_cast<std::uint32_t>(((now() - t.base) / timer_divider(t)) & 0xFFFFu);
+    return static_cast<std::uint32_t>(timer_ticks(t, now()) & 0xFFFFu);
 }
 
 std::uint32_t timer_read(int n) {
     const std::uint64_t due = scheduled_at(kEventTimer0 + n);
     if (due > now()) return timer_count(n);
     const Timer &t = g_timers[n];
-    return static_cast<std::uint32_t>(((due - 1 - t.base) / timer_divider(t)) & 0xFFFFu);
+    return static_cast<std::uint32_t>(timer_ticks(t, due - 1) & 0xFFFFu);
 }
 
 void timer_set_count(int n, std::uint32_t value) {
     Timer &t = g_timers[n];
     t.frozen = value & 0xFFFFu;
-    t.base = now() - static_cast<std::uint64_t>(value & 0xFFFFu) * timer_divider(t);
+    const std::uint64_t ticks = value & 0xFFFFu;
+    t.base = now() - ((t.mode & 3u) == 3 ? ps2::video_timing().cycles_for_scanlines(kEeClock, ticks) : ticks * timer_divider(t));
 }
 
 void timer_schedule(int n);
@@ -80,7 +89,7 @@ void timer_schedule(int n);
 void timer_event(int n, std::uint64_t at) {
     Timer &t = g_timers[n];
     if (!(t.mode & 0x80u)) return;
-    const std::uint32_t count = static_cast<std::uint32_t>(((at - t.base) / timer_divider(t)) & 0xFFFFu);
+    const std::uint32_t count = static_cast<std::uint32_t>(timer_ticks(t, at) & 0xFFFFu);
     if (count == (t.comp & 0xFFFFu)) {
         t.mode |= 0x400u;
         if (t.mode & 0x100u) intc_raise(9u + static_cast<unsigned>(n));
@@ -106,8 +115,7 @@ void timer_schedule(int n) {
     std::uint32_t ticks = to_compare;
     if ((t.mode & 0x200u) && to_overflow < ticks) ticks = to_overflow;
     if (!(t.mode & 0x100u)) ticks = to_overflow;
-    const std::uint64_t div = timer_divider(t);
-    const std::uint64_t at = t.base + ((now() - t.base) / div + ticks) * div;
+    const std::uint64_t at = timer_at(t, timer_ticks(t, now()) + ticks);
     schedule(kEventTimer0 + n, at, [n, at] { timer_event(n, at); });
 }
 
@@ -126,14 +134,31 @@ void reset() {
     dmac::reset();
     ipu::reset();
     g_regs.clear();
+    std::memset(g_crt, 0, sizeof g_crt);
     for (Timer &t : g_timers) t = Timer{};
     g_timers[3].mode = 0x183u;
 }
 
-void vblank_start() {
+VideoTiming video_timing() {
+    return video_timing_for(g_options.pal, g_crt[1] == 0 || g_crt[0] != 0, g_crt[1]);
+}
+
+void retime_legacy_video() {
+    const auto old_line = (kEeClock / (g_options.pal ? 50u : 60u)) * 2 / (g_options.pal ? 625u : 525u);
+    for (int n = 0; n < 4; ++n) {
+        Timer &timer = g_timers[n];
+        if ((timer.mode & 0x83u) != 0x83u) continue;
+        const auto count = static_cast<std::uint32_t>(((now() - timer.base) / old_line) & 0xFFFFu);
+        timer_set_count(n, count);
+        timer_schedule(n);
+    }
+}
+
+void vblank_start(std::uint64_t at) {
+    const auto timing = video_timing();
     intc_raise(2);
-    gs::vblank(true);
-    schedule(kEventVblankEnd, now() + hblank_cycles() * 22u, [] { intc_raise(3); });
+    schedule(kEventGsVblank, at + timing.half_lines_cycles(kEeClock, timing.gs_half_lines), [] { gs::vblank(true); });
+    schedule(kEventVblankEnd, at + timing.half_lines_cycles(kEeClock, timing.blank_half_lines), [] { intc_raise(3); });
 }
 
 std::uint32_t intc_pending() { return g_intc_stat & g_intc_mask; }
@@ -174,11 +199,19 @@ std::uint64_t gs_csr() { return gs::read_privileged(0x12001000u); }
 void gs_set_imr(std::uint64_t value) { gs::write_privileged(0x12001010u, value); }
 
 void gs_set_crt(std::uint32_t interlace, std::uint32_t mode, std::uint32_t field) {
+    std::uint32_t counts[4];
+    for (int n = 0; n < 4; ++n) counts[n] = timer_count(n);
     g_crt[0] = interlace;
     g_crt[1] = mode;
     g_crt[2] = field;
+    gs::write_privileged(0x12000020u, (gs::display_regs().smode2 & ~3ull) | (interlace & 1u) | ((field & 1u) << 1));
     std::fprintf(stderr, "[gs] SetGsCrt interlace %u mode 0x%X field %u\n", interlace, mode, field);
     if (!g_options.rate_forced) g_options.pal = mode == 3u;
+    if (!video_timing().supported) std::fprintf(stderr, "[gs] timing mode 0x%X uses an analog fallback\n", mode);
+    for (int n = 0; n < 4; ++n) {
+        timer_set_count(n, counts[n]);
+        timer_schedule(n);
+    }
 }
 
 void dmac_raise(unsigned channel) {
@@ -295,6 +328,7 @@ namespace ps2::hw {
 
 std::function<void()> event_action(int id, std::uint64_t at) {
     if (id == kEventVblankEnd) return [] { intc_raise(3); };
+    if (id == kEventGsVblank) return [] { gs::vblank(true); };
     if (id >= kEventTimer0 && id <= kEventTimer3) return [n = id - kEventTimer0, at] { timer_event(n, at); };
     return [] {};
 }
@@ -307,6 +341,8 @@ void state(ps2::state::Stream &s) {
     s.map(g_regs);
     s.pod(g_crt);
     s.pod(g_timers);
+    if (s.version() >= 5) s.pod(g_intc_latched);
+    else if (s.loading()) g_intc_latched = g_intc_stat;
 }
 
 }

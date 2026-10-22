@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression checks for the Devil May Cry native build.
 
-usage: python scripts/dmc_regress.py [--record] [--only name,...] [--keep]
+usage: python scripts/dmc_regress.py [--record] [--only name,...] [--keep] [--out directory]
 
 Each case boots fresh or loads a save state from games/dmc, runs the native runner headless for a
 fixed number of frames with scripted input, then checks:
@@ -79,8 +79,9 @@ def mean_p99(a, b):
     from PIL import Image, ImageChops
     if a.size != b.size:
         return 255.0, 255
-    d = ImageChops.difference(a.convert('RGB'), b.convert('RGB')).convert('L')
-    hist = d.histogram()
+    d = ImageChops.difference(a.convert('RGB'), b.convert('RGB'))
+    channels = [band.histogram() for band in d.split()]
+    hist = [sum(channel[i] for channel in channels) for i in range(256)]
     total = sum(hist)
     mean = sum(i * n for i, n in enumerate(hist)) / total
     acc, p99 = 0, 0
@@ -112,6 +113,8 @@ def run_case(case, record):
     with open(os.path.join(out, 'run.log'), 'w', encoding='utf-8') as f:
         f.write(log)
     problems = []
+    if proc.returncode:
+        problems.append(f'runner exited with status {proc.returncode}')
     if 'halted: frame limit reached' not in log:
         reason = re.search(r'\[ee\] halted: (.*)', log)
         problems.append('did not reach the frame limit' + (f' ({reason.group(1)})' if reason else f' (exit {proc.returncode})'))
@@ -155,19 +158,27 @@ def run_case(case, record):
 
 
 def main():
+    global WORK
     parser = argparse.ArgumentParser()
     parser.add_argument('--record', action='store_true', help='replace the golden frames with this run')
     parser.add_argument('--only', help='comma-separated case names')
     parser.add_argument('--keep', action='store_true', help='keep every dumped frame')
+    parser.add_argument('--out', default=WORK, help='output directory (use distinct directories for concurrent runs)')
     args = parser.parse_args()
+    WORK = os.path.abspath(args.out)
     for need in (RUNNER, ELF, ISO):
         if not os.path.exists(need):
             sys.exit(f'missing {need}')
     selected = [c for c in CASES if not args.only or c['name'] in args.only.split(',')]
+    if args.only:
+        unknown = set(args.only.split(',')) - {c['name'] for c in CASES}
+        if unknown:
+            parser.error('unknown cases: ' + ', '.join(sorted(unknown)))
     failed = 0
     for case in selected:
         if case['state'] and not os.path.exists(os.path.join(GAME, case['state'])):
-            print(f"SKIP {case['name']}: no save state {case['state']}")
+            print(f"FAIL {case['name']}: no save state {case['state']}")
+            failed += 1
             continue
         problems, shots, seconds = run_case(case, args.record)
         status = 'FAIL' if problems else 'ok  '

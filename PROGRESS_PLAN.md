@@ -27,7 +27,7 @@ Phase 4 - Gameplay
 
 Phase 6 - Validation and performance
 
-- [ ] Replace linear SPU2 interpolation with the hardware's Gaussian table (from a verified source).
+- [x] Replace linear SPU2 interpolation with the hardware's Gaussian table (512 published coefficients checked against PCSX2, disc-free tests and before/after audio captures).
 - [ ] Compare the stabbing cutscene's fire patches with PCSX2.
 - [ ] Longer soak test (an hour of play, native and web).
 - [ ] Browser memory card persistence and export/import with real save data.

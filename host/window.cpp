@@ -131,7 +131,7 @@ SDL_AudioDeviceID g_audio = 0;
 // the keyboard drives the first controller port along with the first game controller, a second one is player 2
 SDL_GameController *g_pads[2] = {};
 std::uint32_t g_tex_w = 0, g_tex_h = 0;
-std::uint64_t g_last = 0;
+double g_last = 0;
 std::vector<std::uint32_t> g_pixels;
 bool g_gpu_present = false;
 
@@ -343,7 +343,7 @@ void pace() {
         return;
     }
     const std::uint64_t frequency = SDL_GetPerformanceFrequency();
-    const std::uint64_t period = frequency / (ps2::g_options.pal ? 50 : 60);
+    const double period = frequency * ps2::video_timing().field_seconds();
     const std::uint64_t now = SDL_GetPerformanceCounter();
     if (g_last && now - g_last < period) {
         SDL_Delay(static_cast<Uint32>((period - (now - g_last)) * 1000 / frequency));

@@ -370,20 +370,43 @@ class Output extends AudioWorkletProcessor {
     this.samples = new Int16Array(buffer, base + 16, this.capacity * 2);
     this.left = 0;
     this.right = 0;
+    this.playing = false;
+    this.fade = 0;
+    this.gain = 0;
+    this.resumeFrames = Math.min(2880, this.capacity >>> 1);
   }
   process(inputs, outputs) {
     const left = outputs[0][0], right = outputs[0][1];
     const write = Atomics.load(this.ring, 0), mask = this.capacity - 1;
     let read = Atomics.load(this.ring, 1);
+    let available = (write - read) >>> 0;
+    // Wait for 60 ms at startup and after starvation instead of playing isolated tiny bursts.
+    if (!this.playing && this.fade === 0 && available >= this.resumeFrames) {
+      this.playing = true;
+      this.gain = 0;
+    }
     for (let i = 0; i < left.length; ++i) {
-      if (read !== write) {
+      if (this.playing && available !== 0) {
         const at = (read & mask) * 2;
-        this.left = this.samples[at] / 32768;
-        this.right = this.samples[at + 1] / 32768;
+        this.gain = Math.min(1, this.gain + 1 / 240);
+        this.left = this.samples[at] / 32768 * this.gain;
+        this.right = this.samples[at + 1] / 32768 * this.gain;
         read = (read + 1) >>> 0;
+        --available;
       } else {
-        this.left *= 0.995;
-        this.right *= 0.995;
+        if (this.playing) {
+          this.playing = false;
+          this.fade = 240;
+          this.fadeLeft = this.left;
+          this.fadeRight = this.right;
+        }
+        if (this.fade !== 0) {
+          const gain = --this.fade / 240;
+          this.left = this.fadeLeft * gain;
+          this.right = this.fadeRight * gain;
+        } else {
+          this.left = this.right = 0;
+        }
       }
       left[i] = this.left;
       right[i] = this.right;

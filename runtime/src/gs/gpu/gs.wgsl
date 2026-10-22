@@ -438,6 +438,10 @@ struct Setup {
     clut: u32,
     zmax: u32,
     dec: u32,
+    dimx: vec2<u32>,
+    tex1: u32,
+    lod_bias: i32,
+    mip: array<u32, 6>,
     tf: Fmt,
     ff: Fmt,
     zf: Fmt,
@@ -459,6 +463,7 @@ const F_FBA: u32 = 4096u;
 const F_TCC: u32 = 8192u;
 const F_BILINEAR: u32 = 16384u;
 const F_AEM: u32 = 32768u;
+const F_DTHE: u32 = 65536u;
 
 fn load_setup(at: u32) -> Setup {
     var s: Setup;
@@ -493,6 +498,10 @@ fn load_setup(at: u32) -> Setup {
     s.clut = data[at + 22u];
     s.zmax = data[at + 23u];
     s.dec = data[at + 24u];
+    s.dimx = vec2<u32>(data[at + 25u], data[at + 26u]);
+    s.tex1 = data[at + 27u];
+    s.lod_bias = (i32(data[at + 28u]) ^ 2048) - 2048;
+    for (var n = 0u; n < 6u; n++) { s.mip[n] = data[at + 29u + n]; }
     s.tf = fmt_of(s.tpsm, s.tbp, s.tbw);
     s.ff = fmt_of(s.fpsm, s.fbp, s.fbw);
     s.zf = fmt_of(s.zpsm, s.zbp, s.fbw);
@@ -603,7 +612,7 @@ fn convert(s: Setup, raw: u32) -> u32 {
     }
 }
 
-fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
+fn sample_level(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
     if (!has(s, F_BILINEAR)) {
         return fetch(s, i32(floor(uin)), i32(floor(vin)), k);
     }
@@ -612,6 +621,51 @@ fn sample(s: Setup, uin: f32, vin: f32, k: u32) -> u32 {
     let x0 = i32(floor(u));
     let y0 = i32(floor(v));
     return blend4(fetch(s, x0, y0, k), fetch(s, x0 + 1, y0, k), fetch(s, x0, y0 + 1, k), fetch(s, x0 + 1, y0 + 1, k), u - f32(x0), v - f32(y0));
+}
+
+fn mip_sample(s: Setup, u: f32, v: f32, k: u32, n: u32) -> u32 {
+    var t = s;
+    if (n != 0u) {
+        let descriptor = s.mip[n - 1u];
+        t.tbp = descriptor & 16383u;
+        t.tbw = descriptor >> 14u;
+        t.tw = u32(max(i32(s.tw) - i32(n), 0));
+        t.th = u32(max(i32(s.th) - i32(n), 0));
+        t.minu >>= n; t.maxu >>= n; t.minv >>= n; t.maxv >>= n;
+        t.tf = fmt_of(t.tpsm, t.tbp, t.tbw);
+        t.dec = 0xFFFFFFFFu;
+    }
+    let scale = f32(1u << n);
+    return sample_level(t, u / scale, v / scale, k);
+}
+
+fn sample(s: Setup, u: f32, v: f32, q: f32, k: u32) -> u32 {
+    let mxl = min((s.tex1 >> 2u) & 7u, 6u);
+    if (mxl == 0u) { return sample_level(s, u, v, k); }
+    var lod = f32(s.lod_bias) / 16.0;
+    if ((s.tex1 & 1u) == 0u && !has(s, F_FST)) {
+        lod -= log2(max(abs(q), 1.0e-30)) * f32(1u << ((s.tex1 >> 19u) & 3u));
+    }
+    if (lod <= 0.0) { return sample_level(s, u, v, k); }
+    let mmin = (s.tex1 >> 6u) & 7u;
+    var t = s;
+    t.flags &= ~F_BILINEAR;
+    if (mmin == 1u || mmin >= 4u) { t.flags |= F_BILINEAR; }
+    if (mmin < 2u) { return sample_level(t, u, v, k); }
+    lod = min(lod, f32(mxl));
+    let tri = (mmin & 1u) != 0u;
+    let first = u32(floor(lod + select(0.5, 0.0, tri)));
+    let a = mip_sample(t, u, v, k, first);
+    if (!tri || first == mxl) { return a; }
+    let b = mip_sample(t, u, v, k, first + 1u);
+    let fraction = lod - f32(first);
+    var out = 0u;
+    for (var ch = 0u; ch < 32u; ch += 8u) {
+        let av = f32((a >> ch) & 255u);
+        let bv = f32((b >> ch) & 255u);
+        out |= u32(av + (bv - av) * fraction + 0.5) << ch;
+    }
+    return out;
 }
 
 fn blend4(c00: u32, c10: u32, c01: u32, c11: u32, fx: f32, fy: f32) -> u32 {
@@ -754,7 +808,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             u = at.s / q * f32(1u << s.tw);
             v = at.t / q * f32(1u << s.th);
         }
-        let t = sample(s, u, v, k);
+        let t = sample(s, u, v, at.q, k);
         let tr = i32(t & 0xFFu);
         let tg = i32((t >> 8u) & 0xFFu);
         let tb = i32((t >> 16u) & 0xFFu);
@@ -893,16 +947,25 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
             } else if (bd == 1u) {
                 dv = cd;
             }
-            var o = (((av - bv) * cc) >> vec3<u32>(7u)) + dv;
-            if (colclamp) {
-                o = clamp(o, vec3<i32>(0), vec3<i32>(255));
-            } else {
-                o = o & vec3<i32>(0xFF);
-            }
+            let o = (((av - bv) * cc) >> vec3<u32>(7u)) + dv;
             r = o.x;
             g = o.y;
             b = o.z;
-        } else if (!colclamp) {
+        }
+        if (has(s, F_DTHE) && (s.fpsm == 2u || s.fpsm == 10u)) {
+            // Matrix coordinates stay at native resolution when rendering extra samples.
+            let row = s.dimx[u32(y & 3) >> 1u];
+            let shift = u32(((y & 1) * 4 + (x & 3)) * 4);
+            let dither = (i32((row >> shift) & 7u) ^ 4) - 4;
+            r += dither;
+            g += dither;
+            b += dither;
+        }
+        if (colclamp) {
+            r = clamp255(r);
+            g = clamp255(g);
+            b = clamp255(b);
+        } else {
             r = r & 0xFF;
             g = g & 0xFF;
             b = b & 0xFF;
@@ -923,7 +986,7 @@ fn plot(s: Setup, x: i32, y: i32, k: u32, at: Attr) {
 }
 
 const PRIM_WORDS: u32 = 28u;
-const SETUP_WORDS: u32 = 25u;
+const SETUP_WORDS: u32 = 35u;
 
 fn fat(i: u32) -> f32 {
     return bitcast<f32>(data[i]);
@@ -971,8 +1034,11 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
                 return;
             }
             let w2 = 1.0 - w0 - w1;
-            let c = vertex_attr(p, 0u) * w0 + vertex_attr(p, 1u) * w1 + vertex_attr(p, 2u) * w2;
-            let t = vertex_tex(p, 0u) * w0 + vertex_tex(p, 1u) * w1 + vertex_tex(p, 2u) * w2;
+            // Keep constant channels exact; 127.99999 would fail AREF=128 on a repeated surface pass.
+            let c0 = vertex_attr(p, 0u);
+            let c = c0 + (vertex_attr(p, 1u) - c0) * w1 + (vertex_attr(p, 2u) - c0) * w2;
+            let t0 = vertex_tex(p, 0u);
+            let t = t0 + (vertex_tex(p, 1u) - t0) * w1 + (vertex_tex(p, 2u) - t0) * w2;
             at = Attr(c.x, c.y, c.z, c.w, t.x, t.y, t.z, t.w, z_at(p, fat(p + 25u) * w1 + fat(p + 26u) * w2));
         }
         case 1u {
@@ -1056,8 +1122,10 @@ fn shade_at(p: u32, s: Setup, x: i32, y: i32, k: u32, px: f32, py: f32) {
             if (steps != 0) {
                 t = f32(hit) / f32(steps);
             }
-            let c = vertex_attr(p, 0u) * (1.0 - t) + vertex_attr(p, 1u) * t;
-            let tex = vertex_tex(p, 0u) * (1.0 - t) + vertex_tex(p, 1u) * t;
+            let c0 = vertex_attr(p, 0u);
+            let c = c0 + (vertex_attr(p, 1u) - c0) * t;
+            let t0 = vertex_tex(p, 0u);
+            let tex = t0 + (vertex_tex(p, 1u) - t0) * t;
             at = Attr(c.x, c.y, c.z, c.w, tex.x, tex.y, tex.z, tex.w, z_at(p, fat(p + 25u) * t));
         }
         default {

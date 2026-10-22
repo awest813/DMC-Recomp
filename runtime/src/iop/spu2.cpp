@@ -1,4 +1,5 @@
 #include "spu2.hpp"
+#include "spu2_gaussian.hpp"
 
 #include "hw.hpp"
 #include "iop.hpp"
@@ -77,9 +78,19 @@ struct Core {
 std::vector<std::uint16_t> g_ram(kRamWords);
 Core g_cores[2];
 bool g_block_end[2][24][2];
+std::int16_t g_history[2][24][3] = {};
+
+int voice_core(const Voice &v) {
+    return reinterpret_cast<std::uintptr_t>(&v) >= reinterpret_cast<std::uintptr_t>(g_cores[1].voices) ? 1 : 0;
+}
+
+std::int16_t *history(const Voice &v) {
+    const int core = voice_core(v);
+    return g_history[core][&v - g_cores[core].voices];
+}
 
 bool *block_end(const Voice &v) {
-    const int c = &v >= g_cores[1].voices ? 1 : 0;
+    const int c = voice_core(v);
     return g_block_end[c][&v - g_cores[c].voices];
 }
 std::uint16_t g_spdif_out = 0, g_spdif_mode = 0, g_spdif_media = 0;
@@ -135,6 +146,7 @@ void key_on(Voice &v) {
     v.end = false;
     v.next = v.ssa;
     v.s1 = v.s2 = 0;
+    std::fill_n(history(v), 3, 0);
     v.position = 0;
     v.phase = kAttack;
     v.env = Envelope{};
@@ -174,19 +186,31 @@ std::int32_t volume(std::uint16_t reg, Envelope &e) {
 
 std::int16_t clamp16(std::int32_t v) { return static_cast<std::int16_t>(std::clamp(v, -32768, 32767)); }
 
-void render_voice(Voice &v, std::int32_t (*sum)[2], std::int16_t *raw) {
+void render_voice(Voice &v, std::int32_t (*sum)[2], std::int32_t (*wet)[2], unsigned gates, std::int16_t *raw) {
     if (v.key_on) key_on(v);
     const std::uint32_t step = std::min<std::uint32_t>(v.pitch, 0x3FFFu);
     const bool sweep_l = v.voll & 0x8000u, sweep_r = v.volr & 0x8000u;
     const std::int32_t fixed_l = static_cast<std::int16_t>(v.voll << 1), fixed_r = static_cast<std::int16_t>(v.volr << 1);
     std::uint32_t position = v.position;
+    std::int16_t *previous = history(v);
     for (unsigned n = 0; n < kBatch; ++n) {
         if (v.phase == kOff) break;
         const std::uint32_t index = position >> 12, frac = position & 0xFFFu;
-        const std::int32_t sample = (v.buffer[index] * static_cast<std::int32_t>(0x1000 - frac) + v.buffer[index + 1] * static_cast<std::int32_t>(frac)) >> 12;
+        std::int32_t sample;
+        if (index >= 3) {
+            sample = gaussian(v.buffer + index - 3, frac);
+        } else {
+            std::int16_t taps[4];
+            for (int tap = 0; tap < 4; ++tap) {
+                const int at = static_cast<int>(index) + tap - 3;
+                taps[tap] = at < 0 ? previous[at + 3] : v.buffer[at];
+            }
+            sample = gaussian(taps, frac);
+        }
         position += step;
         while ((position >> 12) >= 28) {
             position -= 28u << 12;
+            std::copy_n(v.buffer + 25, 3, previous);
             std::memmove(v.buffer, v.buffer + 28, 28 * sizeof(std::int16_t));
             v.end |= block_end(v)[0];
             v.block[0] = v.block[1];
@@ -198,8 +222,12 @@ void render_voice(Voice &v, std::int32_t (*sum)[2], std::int16_t *raw) {
         update_envelope(v);
         const std::int32_t out = sample * v.env.level >> 15;
         if (raw) raw[n] = clamp16(out);
-        sum[n][0] += out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
-        sum[n][1] += out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
+        const std::int32_t left = out * (sweep_l ? volume(v.voll, v.vol[0]) : fixed_l) >> 15;
+        const std::int32_t right = out * (sweep_r ? volume(v.volr, v.vol[1]) : fixed_r) >> 15;
+        if (gates & 1u) sum[n][0] += left;
+        if (gates & 2u) sum[n][1] += right;
+        if (gates & 4u) wet[n][0] += left;
+        if (gates & 8u) wet[n][1] += right;
     }
     v.position = position;
 }
@@ -262,6 +290,7 @@ void write_rings(int core, const std::int16_t (*rings)[kBatch]) {
 void tick() {
     std::int16_t out[kBatch * 2];
     std::int32_t sum[2][kBatch][2] = {};
+    std::int32_t wet[2][kBatch][2] = {};
     std::int16_t rings[2][8][kBatch] = {};
     static const bool count = std::getenv("PS2_SPU2_COUNT") != nullptr;
     static std::uint64_t ticks = 0, active = 0, phases[5] = {};
@@ -273,12 +302,18 @@ void tick() {
                 ++active;
                 ++phases[v.phase];
             }
-            render_voice(v, sum[c], i == 1 ? rings[c][2] : i == 3 ? rings[c][3] : nullptr);
+            const auto routed = [&](unsigned reg) { return (g_cores[c].regs[(reg + (i >= 16 ? 2 : 0)) / 2] >> (i & 15)) & 1u; };
+            const unsigned gates = routed(0x188) | (routed(0x190) << 1) | (routed(0x18C) << 2) | (routed(0x194) << 3);
+            render_voice(v, sum[c], wet[c], gates, i == 1 ? rings[c][2] : i == 3 ? rings[c][3] : nullptr);
         }
-        // Reverb is not modelled, so the wet rings stay silent.
+        // These are the voice buses before MMIX/reverb, not the reverb return.
         for (unsigned n = 0; n < kBatch; ++n) {
             rings[c][4][n] = clamp16(sum[c][n][0]);
             rings[c][5][n] = clamp16(sum[c][n][1]);
+            rings[c][6][n] = clamp16(wet[c][n][0]);
+            rings[c][7][n] = clamp16(wet[c][n][1]);
+            sum[c][n][0] = rings[c][4][n];
+            sum[c][n][1] = rings[c][5][n];
         }
         std::int16_t unused[2];
         for (unsigned n = 0; n < kBatch; ++n)
@@ -491,8 +526,15 @@ void write_global(std::uint32_t off, std::uint32_t value) {
 void reset() {
     kernel::register_job(kernel::kJobSpuTick, [](const kernel::Job &) { tick(); });
     std::fill(g_ram.begin(), g_ram.end(), 0);
-    for (Core &k : g_cores) k = Core{};
+    for (Core &k : g_cores) {
+        k = Core{};
+        for (unsigned reg : {0x188u, 0x18Cu, 0x190u, 0x194u}) {
+            k.regs[reg / 2] = 0xFFFFu;
+            k.regs[reg / 2 + 1] = 0xFFu;
+        }
+    }
     std::memset(g_block_end, 0, sizeof g_block_end);
+    std::memset(g_history, 0, sizeof g_history);
     g_spdif_out = g_spdif_mode = g_spdif_media = 0;
     g_audio.clear();
     g_record = std::getenv("PS2_DUMP_AUDIO") != nullptr;
@@ -609,6 +651,8 @@ void state(ps2::state::Stream &s) {
     s.pod(g_spdif_media);
     s.pod(g_next_tick);
     s.pod(g_tick_pending);
+    if (s.version() >= 4) s.pod(g_history);
+    else if (s.loading()) std::memset(g_history, 0, sizeof g_history);
 }
 
 }

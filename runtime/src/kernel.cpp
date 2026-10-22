@@ -265,7 +265,7 @@ void run_alarms(Cpu &c) {
         if (it == g_alarms.end()) continue;
         const Alarm alarm = it->second;
         g_alarms.erase(it);
-        run_guest(c, alarm.callback, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(now() / hblank_cycles()), alarm.arg, alarm.gp);
+        run_guest(c, alarm.callback, static_cast<std::uint32_t>(id), static_cast<std::uint32_t>(video_timing().scanlines_elapsed(kEeClock, now())), alarm.arg, alarm.gp);
         g_reschedule = true;
     }
 }
@@ -491,7 +491,7 @@ void handle_syscall(Cpu &c, std::uint32_t pc) {
     case 0x18: case 0x1E: case 0xFC: case 0xFE: {
         const int id = lowest_free(g_alarms, 64);
         if (id < 0) { ret(c, -1); break; }
-        g_alarms[id] = Alarm{arg(c, 1), arg(c, 2), c.r[28].w[0], now() + static_cast<std::uint64_t>(arg(c, 0) & 0xFFFFu) * hblank_cycles()};
+        g_alarms[id] = Alarm{arg(c, 1), arg(c, 2), c.r[28].w[0], now() + video_timing().cycles_for_scanlines(kEeClock, arg(c, 0) & 0xFFFFu)};
         arm_alarm(id);
         ret(c, id);
         break;

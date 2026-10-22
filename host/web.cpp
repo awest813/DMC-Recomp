@@ -278,7 +278,7 @@ void pace() {
         g_next_frame = 0.0;
         return;
     }
-    const double period = ps2::g_options.pal ? 20.0 : 1000.0 / 59.94;
+    const double period = ps2::video_timing().field_seconds() * 1000.0;
     const double now = emscripten_get_now();
     if (g_next_frame == 0.0 || now - g_next_frame > 200.0) g_next_frame = now;
     g_next_frame += period;
