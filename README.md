@@ -50,7 +50,7 @@ Along the way it also needed a boot path like the BIOS gives, a module loaded fr
 
 ## Devil May Cry on Windows (this branch)
 
-The `dmc-port` branch brings up Devil May Cry (NTSC-U, `SLUS_202.16`) and builds everything on Windows with clang, Ninja, wgpu-native, SDL2 and Emscripten. It plays from boot into Mission 1 natively and in the browser at 60 fps. Along the way it fixed several generic runtime bugs: a thread that kept running after `ExitDeleteThread`, VU0 macro-mode MAC flags, the scratchpad DMA interleave mode, and alpha-test speckles in the software renderer. It also adds a Windows launcher (`Play Devil May Cry.bat`), remappable keys and a regression suite. [HANDOFF.md](HANDOFF.md) has the status, build steps and open issues; [ENGINEERING_LOG.md](ENGINEERING_LOG.md) has how each problem was found.
+The `main` branch includes the DMC port from `dmc-port`: Devil May Cry (NTSC-U, `SLUS_202.16`) and builds everything on Windows with clang, Ninja, wgpu-native, SDL2 and Emscripten. It plays from boot into Mission 1 natively and in the browser at 60 fps. Along the way it fixed several generic runtime bugs: a thread that kept running after `ExitDeleteThread`, VU0 macro-mode MAC flags, the scratchpad DMA interleave mode, and alpha-test speckles in the software renderer. It also adds a Windows launcher (`Play Devil May Cry.bat`), remappable keys and a regression suite. [HANDOFF.md](HANDOFF.md) has the status, build steps and open issues; [ENGINEERING_LOG.md](ENGINEERING_LOG.md) has how each problem was found.
 
 ## Port a game of your own
 

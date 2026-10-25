@@ -1,7 +1,7 @@
 name: Deploy ISO picker to Pages
 on:
   push:
-    branches: [dmc-port]
+    branches: [main]
     paths: ['web/pages/**', 'scripts/test_pages.mjs', 'scripts/package_pages.py', '.github/workflows/pages.yml']
   workflow_dispatch:
 permissions:

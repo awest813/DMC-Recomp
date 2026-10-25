@@ -1,6 +1,6 @@
 # Devil May Cry Port - Handoff
 
-Last updated: 2026-10-22. Branch `dmc-port`.
+Last updated: 2026-10-25. Integrated branch `main` (includes all work from `dmc-port`).
 
 Target: Devil May Cry, NTSC-U (`SLUS_202.16`), disc image at `..\Devil May Cry.iso` (outside the repository).
 
