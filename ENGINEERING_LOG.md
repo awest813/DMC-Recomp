@@ -21,6 +21,7 @@ Target: `SLUS_202.16` / `Devil May Cry.iso`. Chronological record of findings, e
 | No-WebGPU crash, doors | 2026-10-21 - Browser without WebGPU, door checks |
 | F5 quick-save | 2026-10-21 - Quick-save in the native window |
 | Audio check, memory card behavior | 2026-10-21 - Audio check, memory card behavior |
+| Performance audit: software rasterizer, IPU IDCT | 2026-11-02 - Performance audit |
 
 ## 2026-10-19 - Initial audit and native bring-up
 
@@ -725,3 +726,11 @@ The initial ordinary p95 field interval improved from about 25–30 ms to 18–1
 Native builds and all eight CTests pass. Repeated real threaded F5/resume checks yield a byte-identical final frame versus uninterrupted execution and refuse malformed checkpoints. Nine game regressions pass with identical frames and no golden refresh, including after the synchronization fixes. Worklet/startup tests still pass. See `docs/NATIVE_STABILITY.md` for the test commands and remaining physical-device/in-game-save validation limits. No game data or captures are tracked, and no commit was requested.
 
 Final native-host target: 1,037/1,037 checks passed, including whitespace/invalid mapping behavior. The final shared-runtime web build and isolated real-runtime browser interaction/audio smoke check also passed after the controller and cross-thread status changes.
+
+## 2026-11-02 - Performance audit
+
+Disc-free pass over the hot paths; details, numbers and the list of things left alone are in `docs/PERFORMANCE_AUDIT.md`. No game data was available in this environment, so the game regressions, web build and GPU renderer were not run.
+
+- Software rasterizer: callgrind showed time spread over `plot`, texel fetch, out-of-line `read_pixel` (a switch plus page math per access) and per-pixel edge tests over the whole bounding box. Moved swizzled access into an inline header (`gs/pixel.hpp`), made texture sampling dispatch on the format once per sample with a small per-level `Tex` (the mip path copied the whole `Setup` per pixel), replaced libm `floorf` in texel coordinates, and limited each triangle row to the exact edge span widened by the float evaluation's error bound. -15.6% instructions, ~11–14% wall time on the new `ps2_accuracy --raster-bench` workload. A frozen copy of the old rasterizer and the new one produced byte-identical GS memory over 144 random scenes, including full-range coordinates, slivers and pixel-center edge ties.
+- IPU: the IDCT skipped nothing; it now skips zero coefficients and all-zero rows (exact, since a sum from +0 never becomes -0) and rounds without libm. DC-only blocks ~2.5x faster, dense blocks ~5–8% slower, outputs identical over 200,000 random blocks. The bitstream reader reads eight bytes at once when available.
+- All seven CTests pass. The raster bench prints `74885681BD3A555B` on both the old and new builds.

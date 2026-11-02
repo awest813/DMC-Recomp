@@ -9,8 +9,10 @@
 #include <cstdio>
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <random>
 #include <string_view>
 #include <vector>
 
@@ -468,12 +470,108 @@ void constant_triangle_alpha(bool gpu) {
 #endif
 }
 
+// Software rasterizer workload: seeded random primitives across formats, texturing, filtering, mipmaps, blending and
+// depth/alpha/destination tests. Prints the best time and a checksum of GS memory; rasterizer speedups meant to keep
+// output identical should keep the checksum of the build they replace.
+int raster_bench(int reps) {
+    using namespace ps2::gs;
+    struct Prim { State state; Vertex v[3]; int count; };
+    std::vector<std::vector<Prim>> scenes;
+    for (unsigned seed = 1; seed <= 6; ++seed) {
+        const unsigned profile = seed % 3; // 0: small triangles, 1: mipmapped, 2: large triangles
+        std::mt19937 rng(seed);
+        const auto r = [&](std::uint32_t n) { return static_cast<std::uint32_t>(rng() % n); };
+        std::vector<Prim> prims;
+        State st{};
+        for (auto &c : st.clut) c = static_cast<std::uint32_t>(rng());
+        st.prmodecont = 1;
+        for (int i = 0; i < 3000; ++i) {
+            if (i == 0 || r(16) == 0) {
+                const std::uint64_t fpsms[] = {PSMCT32, PSMCT32, PSMCT32, PSMCT24, PSMCT16, PSMCT16S};
+                const std::uint64_t tpsms[] = {PSMCT32, PSMCT32, PSMT8, PSMT8, PSMT4, PSMCT16, PSMCT24, PSMT8H, PSMT4HL, PSMT4HH, PSMCT16S};
+                const std::uint64_t zpsms[] = {0, 1, 2, 10};
+                Context &c = st.ctx[0];
+                c.frame = (10ull << 16) | (fpsms[r(6)] << 24) | (r(8) == 0 ? static_cast<std::uint64_t>(rng()) << 32 : 0);
+                c.zbuf = 140 | (zpsms[r(4)] << 24) | (static_cast<std::uint64_t>(r(4) == 0) << 32);
+                c.tex0 = (8960 + r(4) * 512) | (4ull << 14) | (tpsms[r(11)] << 20) | (static_cast<std::uint64_t>(4 + r(5)) << 26) |
+                         (static_cast<std::uint64_t>(4 + r(5)) << 30) | (static_cast<std::uint64_t>(r(2)) << 34) | (static_cast<std::uint64_t>(r(4)) << 35) |
+                         (static_cast<std::uint64_t>(r(2) ? 0 : 2) << 51) | (static_cast<std::uint64_t>(r(32)) << 56);
+                c.tex1 = static_cast<std::uint64_t>(r(2)) << 5;
+                if (profile == 1 || r(4) == 0)
+                    c.tex1 |= (static_cast<std::uint64_t>(r(4)) << 2) | (static_cast<std::uint64_t>(r(6)) << 6) | r(2) |
+                              (static_cast<std::uint64_t>(r(4)) << 19) | (static_cast<std::uint64_t>(r(4096)) << 32);
+                c.miptbp1 = c.miptbp2 = (9500 | (2ull << 14)) | ((9800 | (1ull << 14)) << 20) | ((9900 | (1ull << 14)) << 40);
+                c.clamp = r(4) | (r(4) << 2) | (static_cast<std::uint64_t>(r(64)) << 4) | (static_cast<std::uint64_t>(r(64) + 64) << 14) |
+                          (static_cast<std::uint64_t>(r(64)) << 24) | (static_cast<std::uint64_t>(r(64) + 64) << 34);
+                c.xyoffset = (2048ull - 320) * 16 | ((2048ull - 224) * 16 << 32);
+                c.scissor = r(16) | (static_cast<std::uint64_t>(639 - r(16)) << 16) | (static_cast<std::uint64_t>(r(16)) << 32) |
+                            (static_cast<std::uint64_t>(447 - r(16)) << 48);
+                c.alpha = r(3) | (r(3) << 2) | (r(3) << 4) | (r(3) << 6) | (static_cast<std::uint64_t>(r(256)) << 32);
+                c.test = r(2) | (r(8) << 1) | (r(256) << 4) | (r(4) << 12) | (r(4) == 0 ? 1u << 14 : 0) | (r(2) << 15) | (r(4) ? 1u << 16 : 0) | (r(4) << 17);
+                c.fba = r(4) == 0;
+                st.texa = r(256) | (static_cast<std::uint64_t>(r(2)) << 15) | (static_cast<std::uint64_t>(r(256)) << 32);
+                st.fogcol = rng() & 0xFFFFFFu;
+                st.dimx = (static_cast<std::uint64_t>(rng()) << 32) | static_cast<std::uint32_t>(rng());
+                st.dthe = r(2);
+                st.colclamp = r(4) != 0;
+                st.pabe = r(8) == 0;
+                st.scanmsk = r(8) == 0 ? 2 + r(2) : 0;
+            }
+            Prim p{};
+            const std::uint32_t roll = r(20), type = roll < 15 ? 3 : roll < 18 ? 6 : roll < 19 ? 1 : 0;
+            st.prim = type | (r(2) << 3) | (r(5) ? 0x10u : 0) | (r(6) == 0 ? 0x20u : 0) | (r(2) ? 0x40u : 0) | (r(3) == 0 ? 0x100u : 0);
+            p.state = st;
+            p.count = type == 3 ? 3 : type == 0 ? 1 : 2;
+            const int size = profile == 2 ? 200 : r(4) == 0 ? 120 : 24;
+            const int cx = static_cast<int>(r(680)) - 20, cy = static_cast<int>(r(480)) - 16;
+            for (Vertex &v : p.v) {
+                v.x = static_cast<std::uint32_t>((2048 - 320 + cx + static_cast<int>(r(size)) - size / 2) * 16 + static_cast<int>(r(16)));
+                v.y = static_cast<std::uint32_t>((2048 - 224 + cy + static_cast<int>(r(size)) - size / 2) * 16 + static_cast<int>(r(16)));
+                v.z = static_cast<std::uint32_t>(rng());
+                v.r = static_cast<std::uint8_t>(r(256)); v.g = static_cast<std::uint8_t>(r(256)); v.b = static_cast<std::uint8_t>(r(256));
+                v.a = static_cast<std::uint8_t>(r(2) ? 128 : r(256));
+                v.q = 0.25f + static_cast<float>(r(1000)) / 500.0f;
+                v.s = static_cast<float>(r(2000)) / 1000.0f * v.q;
+                v.t = static_cast<float>(r(2000)) / 1000.0f * v.q;
+                v.u = r(16384);
+                v.v = r(16384);
+                v.f = static_cast<std::uint8_t>(r(256));
+            }
+            prims.push_back(p);
+        }
+        scenes.push_back(std::move(prims));
+    }
+    std::vector<std::uint8_t> initial(kMemorySize);
+    std::mt19937 fill(7);
+    for (auto &b : initial) b = static_cast<std::uint8_t>(fill());
+    double best = 1e30;
+    std::uint64_t checksum = 0;
+    for (int pass = 0; pass < reps; ++pass) {
+        double total = 0;
+        std::uint64_t hash = 0xCBF29CE484222325ull;
+        for (const auto &prims : scenes) {
+            std::memcpy(memory(), initial.data(), kMemorySize);
+            const auto start = std::chrono::steady_clock::now();
+            for (const Prim &p : prims) raster::draw(p.state, p.v, p.count);
+            total += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            for (std::uint32_t i = 0; i < kMemorySize; ++i) hash = (hash ^ memory()[i]) * 0x100000001B3ull;
+        }
+        best = std::min(best, total);
+        checksum = hash;
+    }
+    std::printf("raster bench: best of %d %.1f ms, GS memory checksum %016llX\n", reps, best, static_cast<unsigned long long>(checksum));
+    return 0;
+}
+
 int main(int argc, char **argv) {
     const std::string_view mode = argc > 1 ? argv[1] : "--soft";
     if (mode.starts_with("--timing-")) {
         ps2::g_options.pal = mode == "--timing-pal" || mode == "--timing-pal-ni";
         const bool interlaced = mode != "--timing-pal-ni" && mode != "--timing-ntsc-ni" && mode != "--timing-480p";
         timing(interlaced, mode == "--timing-480p" ? 0x50 : ps2::g_options.pal ? 3 : 2);
+    } else if (mode == "--raster-bench") {
+        ps2::gs::init();
+        return raster_bench(argc > 2 ? std::max(1, std::atoi(argv[2])) : 5);
     } else if (mode == "--soft" || mode == "--gpu") {
         destination_alpha(mode == "--gpu");
         if (!failures) dithering(mode == "--gpu");
@@ -481,7 +579,7 @@ int main(int argc, char **argv) {
         if (!failures) mipmapping(mode == "--gpu");
         if (!failures) constant_triangle_alpha(mode == "--gpu");
     } else {
-        std::fprintf(stderr, "usage: ps2_accuracy [--soft|--gpu|--timing-pal|--timing-ntsc]\n");
+        std::fprintf(stderr, "usage: ps2_accuracy [--soft|--gpu|--timing-pal|--timing-ntsc|--raster-bench [passes]]\n");
         return 2;
     }
     std::printf("%d/%d accuracy checks passed\n", checks - failures, checks);

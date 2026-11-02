@@ -83,12 +83,12 @@ struct Tables {
     Lookup motion = build(kMotionCode), dmv = build(kDmVector), dc_luma = build(kDcSizeLuma), dc_chroma = build(kDcSizeChroma);
     Lookup cbp = build(kCodedBlockPattern);
     DctLookup dct0 = build(kDctTable0), dct1 = build(kDctTable1);
-    double cosines[8][8];
+    double cosines_t[8][8];  // [u][x]
 
     Tables() {
         for (int x = 0; x < 8; ++x)
             for (int u = 0; u < 8; ++u)
-                cosines[x][u] = (u ? 0.5 : 0.5 / std::sqrt(2.0)) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16.0);
+                cosines_t[u][x] = (u ? 0.5 : 0.5 / std::sqrt(2.0)) * std::cos((2 * x + 1) * u * 3.14159265358979323846 / 16.0);
     }
 };
 
@@ -135,7 +135,13 @@ std::uint32_t bits_at(std::size_t bit, unsigned n) {
     if (!n) return 0;
     std::uint64_t v = 0;
     const std::size_t byte = bit >> 3;
-    for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
+    if (byte + 8 <= g_in.size()) {
+        std::uint8_t b[8];
+        std::memcpy(b, g_in.data() + byte, 8);
+        for (int i = 0; i < 8; ++i) v = (v << 8) | b[i];
+    } else {
+        for (std::size_t i = 0; i < 8; ++i) v = (v << 8) | (byte + i < g_in.size() ? g_in[byte + i] : 0u);
+    }
     return static_cast<std::uint32_t>((v << (bit & 7u)) >> (64 - n));
 }
 
@@ -230,21 +236,40 @@ bool read_coefficient(const DctLookup &l, int &run, int &level) {
     return true;
 }
 
+// Most coefficients are zero. A sum that starts at +0 is never -0, so adding a zero product leaves it unchanged: skipping
+// zero coefficients and all-zero rows, while each output still adds its remaining terms in the original order, keeps
+// every result bit-identical to the full separable transform.
 void idct(const int *in, std::int16_t *out) {
-    const auto &c = tables().cosines;
+    const auto &ct = tables().cosines_t;
     double rows[8][8];
-    for (int v = 0; v < 8; ++v)
-        for (int x = 0; x < 8; ++x) {
-            double s = 0;
-            for (int u = 0; u < 8; ++u) s += c[x][u] * in[v * 8 + u];
-            rows[v][x] = s;
+    int live[8], live_rows = 0;
+    for (int v = 0; v < 8; ++v) {
+        double *row = rows[v];
+        bool any = false;
+        for (int u = 0; u < 8; ++u) {
+            const int coefficient = in[v * 8 + u];
+            if (!coefficient) continue;
+            if (!any) std::fill_n(row, 8, 0.0);
+            any = true;
+            for (int x = 0; x < 8; ++x) row[x] += ct[u][x] * coefficient;
         }
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x) {
-            double s = 0;
-            for (int v = 0; v < 8; ++v) s += c[y][v] * rows[v][x];
-            out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(static_cast<int>(std::floor(s + 0.5)), -256, 255));
+        if (any) live[live_rows++] = v;
+    }
+    for (int y = 0; y < 8; ++y) {
+        double sums[8] = {};
+        for (int k = 0; k < live_rows; ++k) {
+            const double cy = ct[live[k]][y];
+            const double *row = rows[live[k]];
+            for (int x = 0; x < 8; ++x) sums[x] += cy * row[x];
         }
+        for (int x = 0; x < 8; ++x) {
+            // floor(sums + 0.5) without a libm call; the sums stay far inside int range.
+            const double t = sums[x] + 0.5;
+            int i = static_cast<int>(t);
+            if (static_cast<double>(i) > t) --i;
+            out[y * 8 + x] = static_cast<std::int16_t>(std::clamp(i, -256, 255));
+        }
+    }
 }
 
 void decode_block(std::int16_t *out, int channel, bool intra, std::uint32_t qsc) {

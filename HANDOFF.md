@@ -1,6 +1,6 @@
 # Devil May Cry Port - Handoff
 
-Last updated: 2026-10-25. Integrated branch `main` (includes all work from `dmc-port`).
+Last updated: 2026-11-02. Integrated branch `main` (includes all work from `dmc-port`).
 
 Target: Devil May Cry, NTSC-U (`SLUS_202.16`), disc image at `..\Devil May Cry.iso` (outside the repository).
 
@@ -70,6 +70,7 @@ python scripts/serve.py build/web-dmc "..\Devil May Cry.iso" 8620 --record games
 | `python scripts/dmc_regress.py` | 9 cases: boot to title, Options menu, shop cutscene, Mission 1 idle/jump/walk, castle hall, sealed door, upper gallery. Fails on a crash, early halt, unhandled syscall, missing IOP import, missing code, a jump that does not land, a walk that does not move, or a screenshot that differs from `games/dmc/golden` (mean > 0.25 or p99 > 12). `--record` refreshes the golden frames; `PS2_GS=soft` checks the software renderer against them. |
 | `python scripts/dmc_explore.py <state> <steps> --start-frame N [--stop-at-battle]` | Greedy explorer: from each checkpoint tries the four stick directions with jumps or Cross taps, keeps the run that ends farthest from where Dante has been (height weighted), reports crashes and missing code, and stops when the battle flag sets. |
 | `powershell -File scripts/webprobe.ps1`, then `node scripts/webprobe.mjs <url> <seconds> [--shot f.png] [--every ms] [--profile s] [--nogpu]` | Headless Chrome harness for the web build: fps/status line, console, screenshot, per-worker CPU profile, and a no-WebGPU mode. `webprobe.ps1 -Stop` closes it. Use it instead of the Claude browser pane for timing; the pane is throttled to ~1 fps when the app window is in the background. |
+| `ps2_accuracy --raster-bench [passes]` (with `-DPS2_BUILD_ACCURACY_TESTS=ON`, `PS2_GS=soft`) | Software rasterizer workload: best time and a GS memory checksum. Output-preserving rasterizer changes must keep the checksum; see [docs/PERFORMANCE_AUDIT.md](docs/PERFORMANCE_AUDIT.md). |
 | `PS2_DUMP_AUDIO=out.wav ...`, then `python scripts/audio_check.py out.wav [--png dir]` | Audio sanity: clipping, DC, silence, dropouts, stereo, loudness strip, spectrogram. |
 
 Save states in `games/dmc` (game data; local only). Pass `--frames` as an absolute frame number when loading one.
@@ -93,7 +94,7 @@ Frame/rendering audit: see [docs/ACCURACY_AUDIT.md](docs/ACCURACY_AUDIT.md). Sha
 2. **The game's first formatted-card save/load remains untested.** Raw SIO2 card read/write, fresh-process reads, failed-write retries and orderly-exit flushing are tested. New cards start unformatted; DMC should offer to format at its first save point, which has not been reached.
 3. **SPU2 accuracy**: Gaussian interpolation, per-voice buses, MMIX dry routing and the core output chain are implemented; see [docs/AUDIO_ACCURACY.md](docs/AUDIO_ACCURACY.md). Reverb/wet MMIX, voice noise, pitch modulation and detailed envelope timing remain incomplete. New states use version 5 for video events and load versions 2-4. Gaussian history is present from version 4 onward; earlier states initialize it to zero.
 4. **Unconfirmed cutscene effect**: hard-edged rectangular fire patches on Dante in the stabbing cutscene (all resolutions). Possibly correct; needs a hardware or PCSX2 reference.
-5. **Software renderer speed in the browser** (~10 fps; the GS thread is the bottleneck). Only matters without WebGPU.
+5. **Software renderer speed in the browser** (~10 fps measured before the 2026-11-02 audit, which cut rasterizer instructions ~16%; not re-measured in the browser). The GS thread is the bottleneck. Only matters without WebGPU. See [docs/PERFORMANCE_AUDIT.md](docs/PERFORMANCE_AUDIT.md).
 6. Without WebGPU the page can log a one-off `requestAdapter` TypeError from WebGPU glue code; the game still runs.
 
 ## Next steps

@@ -1,10 +1,13 @@
 #include "raster.hpp"
 
+#include "pixel.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <tuple>
 
@@ -13,6 +16,16 @@
 namespace ps2::gs::raster {
 
 namespace {
+
+// What texel fetches need; mip levels get their own small copy instead of a whole Setup.
+struct Tex {
+    std::uint32_t tbp, tbw, tpsm, tw, th, cpsm, csa;
+    int wms, wmt;
+    std::uint32_t minu, maxu, minv, maxv;
+    std::uint32_t ta0, ta1;
+    bool aem, bilinear;
+    const std::uint32_t *clut;
+};
 
 struct Setup {
     bool iip, tme, fge, abe, fst;
@@ -28,16 +41,12 @@ struct Setup {
     std::uint64_t dimx;
     int scax0, scax1, scay0, scay1;
     int ofx, ofy;
-    std::uint32_t tbp, tbw, tpsm, tw, th, cpsm, csa;
-    bool tcc, bilinear;
+    Tex tex;
+    bool tcc;
     std::uint64_t tex1, miptbp[2];
-    int tfx, wms, wmt;
-    std::uint32_t minu, maxu, minv, maxv;
-    std::uint32_t ta0, ta1;
-    bool aem;
+    int tfx;
     std::uint32_t fogcol;
     int scanmsk;
-    const std::uint32_t *clut;
 };
 
 struct Attr {
@@ -47,15 +56,22 @@ struct Attr {
 
 int clamp255(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
-std::uint32_t expand16(std::uint32_t c, const Setup &s) {
+std::uint32_t expand16(std::uint32_t c, const Tex &t) {
     const std::uint32_t r = (c & 0x1Fu) << 3, g = ((c >> 5) & 0x1Fu) << 3, b = ((c >> 10) & 0x1Fu) << 3;
     std::uint32_t a;
-    if (c & 0x8000u) a = s.ta1;
-    else a = (s.aem && !(c & 0x7FFFu)) ? 0u : s.ta0;
+    if (c & 0x8000u) a = t.ta1;
+    else a = (t.aem && !(c & 0x7FFFu)) ? 0u : t.ta0;
     return r | (g << 8) | (b << 16) | (a << 24);
 }
 
-std::uint32_t fetch(const Setup &s, int x, int y) {
+// static_cast<int>(std::floor(f)) without a libm call on baseline x86-64; INT_MIN stays put like the converted floor.
+int floor_int(float f) {
+    const int i = static_cast<int>(f);
+    return static_cast<float>(i) > f && i != std::numeric_limits<int>::min() ? i - 1 : i;
+}
+
+template <std::uint32_t Psm>
+std::uint32_t fetch(const Tex &t, int x, int y) {
     const auto wrap = [](int v, int size, int mode, std::uint32_t min, std::uint32_t max) {
         switch (mode) {
         case 0: return v & (size - 1);
@@ -64,32 +80,33 @@ std::uint32_t fetch(const Setup &s, int x, int y) {
         default: return static_cast<int>((static_cast<std::uint32_t>(v) & min) | max);
         }
     };
-    x = wrap(x, 1 << s.tw, s.wms, s.minu, s.maxu);
-    y = wrap(y, 1 << s.th, s.wmt, s.minv, s.maxv);
-    const std::uint32_t raw = read_pixel(s.tpsm, s.tbp, s.tbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
-    switch (s.tpsm) {
+    x = wrap(x, 1 << t.tw, t.wms, t.minu, t.maxu);
+    y = wrap(y, 1 << t.th, t.wmt, t.minv, t.maxv);
+    const std::uint32_t raw = pixel::read(Psm, t.tbp, t.tbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+    switch (Psm) {
     case PSMCT32: case PSMZ32: return raw;
-    case PSMCT24: case PSMZ24: return (raw & 0xFFFFFFu) | (((s.aem && !(raw & 0xFFFFFFu)) ? 0u : s.ta0) << 24);
-    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: return expand16(raw, s);
+    case PSMCT24: case PSMZ24: return (raw & 0xFFFFFFu) | (((t.aem && !(raw & 0xFFFFFFu)) ? 0u : t.ta0) << 24);
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: return expand16(raw, t);
     case PSMT8: case PSMT8H: {
-        const std::uint32_t e = s.clut[raw & 255u];
-        return s.cpsm == PSMCT32 || s.cpsm == PSMCT24 ? e : expand16(e, s);
+        const std::uint32_t e = t.clut[raw & 255u];
+        return t.cpsm == PSMCT32 || t.cpsm == PSMCT24 ? e : expand16(e, t);
     }
     case PSMT4: case PSMT4HL: case PSMT4HH: {
-        const std::uint32_t e = s.clut[((s.csa & 15u) * 16u + (raw & 15u)) & 511u];
-        return s.cpsm == PSMCT32 || s.cpsm == PSMCT24 ? e : expand16(e, s);
+        const std::uint32_t e = t.clut[((t.csa & 15u) * 16u + (raw & 15u)) & 511u];
+        return t.cpsm == PSMCT32 || t.cpsm == PSMCT24 ? e : expand16(e, t);
     }
     default: return raw;
     }
 }
 
-std::uint32_t sample_level(const Setup &s, float u, float v) {
-    if (!s.bilinear) return fetch(s, static_cast<int>(std::floor(u)), static_cast<int>(std::floor(v)));
+template <std::uint32_t Psm>
+std::uint32_t filter(const Tex &t, float u, float v) {
+    if (!t.bilinear) return fetch<Psm>(t, floor_int(u), floor_int(v));
     u -= 0.5f;
     v -= 0.5f;
-    const int x0 = static_cast<int>(std::floor(u)), y0 = static_cast<int>(std::floor(v));
+    const int x0 = floor_int(u), y0 = floor_int(v);
     const float fx = u - static_cast<float>(x0), fy = v - static_cast<float>(y0);
-    const std::uint32_t c00 = fetch(s, x0, y0), c10 = fetch(s, x0 + 1, y0), c01 = fetch(s, x0, y0 + 1), c11 = fetch(s, x0 + 1, y0 + 1);
+    const std::uint32_t c00 = fetch<Psm>(t, x0, y0), c10 = fetch<Psm>(t, x0 + 1, y0), c01 = fetch<Psm>(t, x0, y0 + 1), c11 = fetch<Psm>(t, x0 + 1, y0 + 1);
     std::uint32_t out = 0;
     for (int ch = 0; ch < 32; ch += 8) {
         const float a = static_cast<float>((c00 >> ch) & 0xFFu), b = static_cast<float>((c10 >> ch) & 0xFFu);
@@ -100,29 +117,49 @@ std::uint32_t sample_level(const Setup &s, float u, float v) {
     return out;
 }
 
+// One format dispatch per sample instead of per texel; any other PSM reads like PSMCT32 storage and returns it raw.
+std::uint32_t sample_level(const Tex &t, float u, float v) {
+    switch (t.tpsm) {
+    case PSMCT32: return filter<PSMCT32>(t, u, v);
+    case PSMCT24: return filter<PSMCT24>(t, u, v);
+    case PSMCT16: return filter<PSMCT16>(t, u, v);
+    case PSMCT16S: return filter<PSMCT16S>(t, u, v);
+    case PSMT8: return filter<PSMT8>(t, u, v);
+    case PSMT4: return filter<PSMT4>(t, u, v);
+    case PSMT8H: return filter<PSMT8H>(t, u, v);
+    case PSMT4HL: return filter<PSMT4HL>(t, u, v);
+    case PSMT4HH: return filter<PSMT4HH>(t, u, v);
+    case PSMZ32: return filter<PSMZ32>(t, u, v);
+    case PSMZ24: return filter<PSMZ24>(t, u, v);
+    case PSMZ16: return filter<PSMZ16>(t, u, v);
+    case PSMZ16S: return filter<PSMZ16S>(t, u, v);
+    default: return filter<0x3Fu>(t, u, v);
+    }
+}
+
 std::uint32_t sample(const Setup &s, float u, float v, float q) {
     const unsigned mxl = std::min<unsigned>((s.tex1 >> 2) & 7u, 6u);
-    if (!mxl) return sample_level(s, u, v);
+    if (!mxl) return sample_level(s.tex, u, v);
     const unsigned mmin = (s.tex1 >> 6) & 7u;
     const int bias = static_cast<int>(((s.tex1 >> 32) & 0xFFFu) ^ 0x800u) - 0x800;
     float lod = static_cast<float>(bias) / 16.0f;
     if (!(s.tex1 & 1u) && !s.fst)
         lod -= std::log2(std::max(std::abs(q), 1.0e-30f)) * static_cast<float>(1u << ((s.tex1 >> 19) & 3u));
-    if (lod <= 0) return sample_level(s, u, v);
-    Setup level = s;
+    if (lod <= 0) return sample_level(s.tex, u, v);
+    Tex level = s.tex;
     level.bilinear = mmin == 1 || mmin >= 4;
     if (mmin < 2) return sample_level(level, u, v);
     lod = std::min(lod, static_cast<float>(mxl));
     const bool trilinear = mmin & 1u;
     const unsigned first = static_cast<unsigned>(std::floor(lod + (trilinear ? 0.0f : 0.5f)));
     const auto at_level = [&](unsigned n) {
-        Setup t = level;
+        Tex t = level;
         if (n) {
             const auto descriptor = s.miptbp[(n - 1) / 3] >> (((n - 1) % 3) * 20);
             t.tbp = descriptor & 0x3FFFu;
             t.tbw = (descriptor >> 14) & 0x3Fu;
-            t.tw = s.tw > n ? s.tw - n : 0;
-            t.th = s.th > n ? s.th - n : 0;
+            t.tw = s.tex.tw > n ? s.tex.tw - n : 0;
+            t.th = s.tex.th > n ? s.tex.th - n : 0;
             t.minu >>= n; t.maxu >>= n; t.minv >>= n; t.maxv >>= n;
         }
         const float scale = static_cast<float>(1u << n);
@@ -141,7 +178,7 @@ std::uint32_t sample(const Setup &s, float u, float v, float q) {
 }
 
 std::uint32_t read_frame(const Setup &s, int x, int y) {
-    const std::uint32_t raw = read_pixel(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+    const std::uint32_t raw = pixel::read(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
     switch (s.fpsm) {
     case PSMCT24: return raw | 0x80000000u;
     case PSMCT16: case PSMCT16S:
@@ -153,26 +190,26 @@ std::uint32_t read_frame(const Setup &s, int x, int y) {
 void write_frame(const Setup &s, int x, int y, std::uint32_t c, std::uint32_t mask) {
     switch (s.fpsm) {
     case PSMCT16: case PSMCT16S: {
-        const std::uint32_t old = read_pixel(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+        const std::uint32_t old = pixel::read(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
         const auto pack = [](std::uint32_t v) {
             return ((v >> 3) & 0x1Fu) | (((v >> 11) & 0x1Fu) << 5) | (((v >> 19) & 0x1Fu) << 10) | ((v & 0x80000000u) ? 0x8000u : 0u);
         };
         const std::uint32_t m16 = pack(mask) | ((mask & 0x80000000u) ? 0x8000u : 0u);
-        write_pixel(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), (pack(c) & ~m16) | (old & m16));
+        pixel::write(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), (pack(c) & ~m16) | (old & m16));
         break;
     }
     case PSMCT24: {
-        const std::uint32_t old = read_pixel(PSMCT32, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+        const std::uint32_t old = pixel::read(PSMCT32, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
         const std::uint32_t m = mask | 0xFF000000u;
-        write_pixel(PSMCT32, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), (c & ~m) | (old & m));
+        pixel::write(PSMCT32, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), (c & ~m) | (old & m));
         break;
     }
     default: {
         if (mask) {
-            const std::uint32_t old = read_pixel(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+            const std::uint32_t old = pixel::read(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
             c = (c & ~mask) | (old & mask);
         }
-        write_pixel(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), c);
+        pixel::write(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), c);
         break;
     }
     }
@@ -206,8 +243,8 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
             v = at.t / 16.0f;
         } else {
             const float q = at.q != 0.0f ? at.q : 1.0f;
-            u = at.s / q * static_cast<float>(1 << s.tw);
-            v = at.t / q * static_cast<float>(1 << s.th);
+            u = at.s / q * static_cast<float>(1 << s.tex.tw);
+            v = at.t / q * static_cast<float>(1 << s.tex.th);
         }
         const std::uint32_t t = sample(s, u, v, at.q);
         const int tr = static_cast<int>(t & 0xFFu), tg = static_cast<int>((t >> 8) & 0xFFu), tb = static_cast<int>((t >> 16) & 0xFFu), ta = static_cast<int>(t >> 24);
@@ -242,11 +279,11 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
         return spec && std::sscanf(spec, "%d,%d", &trace_x, &trace_y) == 2;
     }();
     if (tracing && x == trace_x && y == trace_y) {
-        const std::uint32_t old = s.zte ? read_pixel(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) & zmax : 0;
+        const std::uint32_t old = s.zte ? pixel::read(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) & zmax : 0;
         const float q = at.q != 0.0f ? at.q : 1.0f;
-        const float tu = s.fst ? at.s / 16.0f : at.s / q * static_cast<float>(1 << s.tw), tv = s.fst ? at.t / 16.0f : at.t / q * static_cast<float>(1 << s.th);
+        const float tu = s.fst ? at.s / 16.0f : at.s / q * static_cast<float>(1 << s.tex.tw), tv = s.fst ? at.t / 16.0f : at.t / q * static_cast<float>(1 << s.tex.th);
         std::fprintf(stderr, "[pixel] frame %llu fbp %X fbw %u tme %d tbp %X tbw %u tpsm %X tw %u th %u wm %d/%d bil %d uv %.2f %.2f tfx %d -> rgba %d %d %d %d abe %d blend %d%d%d%d fix %u dst %08X z %u old %u zte %d ztst %d zmsk %d ate %d atst %d afail %d fbmsk %08X\n",
-                     static_cast<unsigned long long>(frames_run()), s.fbp, s.fbw, s.tme, s.tbp, s.tbw, s.tpsm, s.tw, s.th, s.wms, s.wmt, s.bilinear ? 1 : 0, tu, tv, s.tfx,
+                     static_cast<unsigned long long>(frames_run()), s.fbp, s.fbw, s.tme, s.tex.tbp, s.tex.tbw, s.tex.tpsm, s.tex.tw, s.tex.th, s.tex.wms, s.tex.wmt, s.tex.bilinear ? 1 : 0, tu, tv, s.tfx,
                      r, g, b, a, s.abe, s.a, s.b, s.c, s.d, s.fix, read_frame(s, x, y), z, old, s.zte, s.ztst, s.zmsk ? 1 : 0, s.ate, s.atst, s.afail, s.fbmsk);
     }
     if (s.fge) {
@@ -292,7 +329,7 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
     }
 
     if (s.zte) {
-        const std::uint32_t old = read_pixel(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) & zmax;
+        const std::uint32_t old = pixel::read(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) & zmax;
         bool pass;
         switch (s.ztst) {
         case 0: pass = false; break;
@@ -341,9 +378,9 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
     }
     if (write_z && s.zte) {
         if (s.zpsm == PSMZ24) {
-            write_pixel(PSMZ24, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), z);
+            pixel::write(PSMZ24, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), z);
         } else {
-            write_pixel(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), z);
+            pixel::write(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), z);
         }
     }
 }
@@ -389,31 +426,31 @@ Setup make_setup(const State &st) {
     s.scay1 = static_cast<int>((c.scissor >> 48) & 0x7FFu);
     s.ofx = static_cast<int>(c.xyoffset & 0xFFFFu);
     s.ofy = static_cast<int>((c.xyoffset >> 32) & 0xFFFFu);
-    s.tbp = static_cast<std::uint32_t>(c.tex0) & 0x3FFFu;
-    s.tbw = static_cast<std::uint32_t>(c.tex0 >> 14) & 0x3Fu;
-    s.tpsm = static_cast<std::uint32_t>(c.tex0 >> 20) & 0x3Fu;
-    s.tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u);
-    s.th = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 30) & 0xFu, 10u);
+    s.tex.tbp = static_cast<std::uint32_t>(c.tex0) & 0x3FFFu;
+    s.tex.tbw = static_cast<std::uint32_t>(c.tex0 >> 14) & 0x3Fu;
+    s.tex.tpsm = static_cast<std::uint32_t>(c.tex0 >> 20) & 0x3Fu;
+    s.tex.tw = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 26) & 0xFu, 10u);
+    s.tex.th = std::min<std::uint32_t>(static_cast<std::uint32_t>(c.tex0 >> 30) & 0xFu, 10u);
     s.tcc = (c.tex0 >> 34) & 1u;
     s.tfx = static_cast<int>(c.tex0 >> 35) & 3;
-    s.cpsm = static_cast<std::uint32_t>(c.tex0 >> 51) & 0xFu;
-    s.csa = static_cast<std::uint32_t>(c.tex0 >> 56) & 0x1Fu;
-    s.bilinear = (c.tex1 >> 5) & 1u;
+    s.tex.cpsm = static_cast<std::uint32_t>(c.tex0 >> 51) & 0xFu;
+    s.tex.csa = static_cast<std::uint32_t>(c.tex0 >> 56) & 0x1Fu;
+    s.tex.bilinear = (c.tex1 >> 5) & 1u;
     s.tex1 = c.tex1;
     s.miptbp[0] = c.miptbp1;
     s.miptbp[1] = c.miptbp2;
-    s.wms = static_cast<int>(c.clamp) & 3;
-    s.wmt = static_cast<int>(c.clamp >> 2) & 3;
-    s.minu = static_cast<std::uint32_t>(c.clamp >> 4) & 0x3FFu;
-    s.maxu = static_cast<std::uint32_t>(c.clamp >> 14) & 0x3FFu;
-    s.minv = static_cast<std::uint32_t>(c.clamp >> 24) & 0x3FFu;
-    s.maxv = static_cast<std::uint32_t>(c.clamp >> 34) & 0x3FFu;
-    s.ta0 = static_cast<std::uint32_t>(st.texa) & 0xFFu;
-    s.aem = (st.texa >> 15) & 1u;
-    s.ta1 = static_cast<std::uint32_t>(st.texa >> 32) & 0xFFu;
+    s.tex.wms = static_cast<int>(c.clamp) & 3;
+    s.tex.wmt = static_cast<int>(c.clamp >> 2) & 3;
+    s.tex.minu = static_cast<std::uint32_t>(c.clamp >> 4) & 0x3FFu;
+    s.tex.maxu = static_cast<std::uint32_t>(c.clamp >> 14) & 0x3FFu;
+    s.tex.minv = static_cast<std::uint32_t>(c.clamp >> 24) & 0x3FFu;
+    s.tex.maxv = static_cast<std::uint32_t>(c.clamp >> 34) & 0x3FFu;
+    s.tex.ta0 = static_cast<std::uint32_t>(st.texa) & 0xFFu;
+    s.tex.aem = (st.texa >> 15) & 1u;
+    s.tex.ta1 = static_cast<std::uint32_t>(st.texa >> 32) & 0xFFu;
     s.fogcol = static_cast<std::uint32_t>(st.fogcol) & 0xFFFFFFu;
     s.scanmsk = static_cast<int>(st.scanmsk) & 3;
-    s.clut = st.clut;
+    s.tex.clut = st.clut;
     return s;
 }
 
@@ -481,9 +518,35 @@ void triangle(const Setup &s, const Vertex *in) {
     const float inv = 1.0f / area;
     const float sg = area > 0.0f ? 1.0f : -1.0f;
     const auto edge_in = [](float e, float gx, float gy) { return e > 0.0f || (e == 0.0f && (gx > 0.0f || (gx == 0.0f && gy > 0.0f))); };
+    // Rows scan only the columns the float edge test below can accept. Vertices sit on a 1/16 grid under 4096, so each
+    // edge function c + m * px is exact in double, and the float form (x1 - px) * (y2 - py) - (x2 - px) * (y1 - py) is
+    // off by at most (|x1 - px||y2 - py| + |x2 - px||y1 - py|) * 2^-23. Widening the exact span by twice that plus a
+    // pixel keeps every accepted pixel; the test itself and the weights are unchanged.
+    const float xs[3] = {x0, x1, x2}, ys[3] = {y0, y1, y2};
+    const bool spans = std::max({std::fabs(x0), std::fabs(x1), std::fabs(x2), std::fabs(y0), std::fabs(y1), std::fabs(y2)}) < 4096.0f;
+    double slack[3] = {};
+    for (int k = 0; k < 3 && spans; ++k) {
+        const int i = (k + 1) % 3, j = (k + 2) % 3;
+        const auto reach = [](double c, double lo, double hi) { return std::max(std::fabs(c - lo), std::fabs(c - hi)); };
+        slack[k] = (reach(xs[i], minx, maxx) * reach(ys[j], miny, maxy) + reach(xs[j], minx, maxx) * reach(ys[i], miny, maxy)) * 0x1p-22;
+    }
     for (int y = miny; y <= maxy; ++y) {
         const float py = static_cast<float>(y);
-        for (int x = minx; x <= maxx; ++x) {
+        int first = minx, last = maxx;
+        for (int k = 0; k < 3 && spans; ++k) {
+            const int i = (k + 1) % 3, j = (k + 2) % 3;
+            // Edge k is e(px) = xs[i] * (ys[j] - py) - xs[j] * (ys[i] - py) + px * (ys[i] - ys[j]); keep sg * e >= -slack.
+            const double c = sg * (static_cast<double>(xs[i]) * (ys[j] - static_cast<double>(py)) - static_cast<double>(xs[j]) * (ys[i] - static_cast<double>(py))) + slack[k];
+            const double m = sg * (static_cast<double>(ys[i]) - ys[j]);
+            if (m == 0.0) {
+                if (c < 0.0) first = maxx + 1;
+                continue;
+            }
+            const double at = std::clamp(-c / m, minx - 2.0, maxx + 2.0);
+            if (m > 0.0) first = std::max(first, static_cast<int>(std::ceil(at)) - 1);
+            else last = std::min(last, static_cast<int>(std::floor(at)) + 1);
+        }
+        for (int x = first; x <= last; ++x) {
             const float px = static_cast<float>(x);
             const float e0 = (x1 - px) * (y2 - py) - (x2 - px) * (y1 - py);
             const float e1 = (x2 - px) * (y0 - py) - (x0 - px) * (y2 - py);
@@ -558,8 +621,8 @@ void draw(const State &st, const Vertex *v, int count) {
             });
         }
         if (frames_run() == frame) {
-            Use &u = (*uses)[{s.tme, static_cast<int>(s.tbp), static_cast<int>(s.tbw), static_cast<int>(s.tpsm), static_cast<int>(s.tw),
-                              static_cast<int>(s.th), static_cast<int>(s.cpsm), static_cast<int>(s.fbp)}];
+            Use &u = (*uses)[{s.tme, static_cast<int>(s.tex.tbp), static_cast<int>(s.tex.tbw), static_cast<int>(s.tex.tpsm), static_cast<int>(s.tex.tw),
+                              static_cast<int>(s.tex.th), static_cast<int>(s.tex.cpsm), static_cast<int>(s.fbp)}];
             if (!u.n) u = {0, 99999, 99999, -99999, -99999};
             ++u.n;
             for (int i = 0; i < count; ++i) {
@@ -569,20 +632,20 @@ void draw(const State &st, const Vertex *v, int count) {
         }
     }
     static const char *skip = std::getenv("PS2_SKIP_TBP");
-    if (skip && s.tme && s.tbp == std::strtoul(skip, nullptr, 16)) return;
+    if (skip && s.tme && s.tex.tbp == std::strtoul(skip, nullptr, 16)) return;
     static const char *trace = std::getenv("PS2_TRACE_PRIM");
     if (trace) {
         static const bool by_frame = trace[0] == 'f';
         static std::uint64_t n = 0, start = std::strtoull(trace + (by_frame ? 1 : 0), nullptr, 10);
         static const char *only = std::getenv("PS2_TRACE_PRIM_BP");
         static const char *type = std::getenv("PS2_TRACE_PRIM_TYPE");
-        const bool wanted = (!only || s.fbp == std::strtoul(only, nullptr, 16) || (s.tme && s.tbp == std::strtoul(only, nullptr, 16))) &&
+        const bool wanted = (!only || s.fbp == std::strtoul(only, nullptr, 16) || (s.tme && s.tex.tbp == std::strtoul(only, nullptr, 16))) &&
                             (!type || (st.prim & 7u) == std::strtoul(type, nullptr, 10));
         if (wanted && (by_frame ? frames_run() == start && ++n <= 1000000 : ++n >= start && n < start + 1000)) {
             std::fprintf(stderr,
                          "[prim] %llu type %u count %d fbp %X fbw %u fpsm %X tme %d tbp %X tbw %u tpsm %X tw %u th %u tcc %d tfx %d cpsm %X csa %u\n",
                          static_cast<unsigned long long>(n), static_cast<unsigned>(st.prim & 7u), count, s.fbp, s.fbw, s.fpsm, s.tme,
-                         s.tbp, s.tbw, s.tpsm, s.tw, s.th, s.tcc, s.tfx, s.cpsm, s.csa);
+                         s.tex.tbp, s.tex.tbw, s.tex.tpsm, s.tex.tw, s.tex.th, s.tcc, s.tfx, s.tex.cpsm, s.tex.csa);
             std::fprintf(stderr,
                          "[prim] %llu abe %d fst %d zte %d ztst %d afail %d fbmsk %08X scissor %d %d %d %d ofs %d %d\n",
                          static_cast<unsigned long long>(n), s.abe, s.fst, s.zte, s.ztst, s.afail, s.fbmsk,
@@ -590,7 +653,7 @@ void draw(const State &st, const Vertex *v, int count) {
             const Context &context = st.ctx[(st.prmodecont & 1u ? st.prim : st.prmode) >> 9 & 1u];
             std::fprintf(stderr, "[prim] %llu tex1 %016llX mip1 %016llX mip2 %016llX bilinear %d\n",
                          static_cast<unsigned long long>(n), static_cast<unsigned long long>(context.tex1),
-                         static_cast<unsigned long long>(context.miptbp1), static_cast<unsigned long long>(context.miptbp2), s.bilinear);
+                         static_cast<unsigned long long>(context.miptbp1), static_cast<unsigned long long>(context.miptbp2), s.tex.bilinear);
             for (int i = 0; i < count; ++i)
                 std::fprintf(stderr, "[prim] %llu v%d %08X %08X z %08X st %.6f %.6f q %.6f rgba %02X%02X%02X%02X uv %04X %04X\n",
                              static_cast<unsigned long long>(n), i, v[i].x, v[i].y, v[i].z, v[i].s, v[i].t, v[i].q,

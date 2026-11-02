@@ -1,6 +1,7 @@
 #include "gs.hpp"
 
 #include "gif.hpp"
+#include "pixel.hpp"
 #include "queue.hpp"
 #include "raster.hpp"
 #include "../hw.hpp"
@@ -29,9 +30,19 @@ std::uint32_t g_setup_generation = 0;
 
 void serve_state(const void *payload);
 
-namespace {
+namespace pixel {
 
 alignas(64) std::uint8_t g_memory[kMemorySize];
+std::uint32_t g_off32[32][64], g_offz32[32][64];
+std::uint32_t g_off16[64][64], g_off16s[64][64], g_offz16[64][64], g_offz16s[64][64];
+std::uint32_t g_off8[64][128], g_off4[128][128];
+
+}
+
+namespace {
+
+using pixel::g_memory, pixel::g_off32, pixel::g_offz32, pixel::g_off16, pixel::g_off16s, pixel::g_offz16, pixel::g_offz16s;
+using pixel::g_off8, pixel::g_off4, pixel::get, pixel::put, pixel::page, pixel::wrap;
 
 std::uint64_t g_pmode, g_smode1, g_smode2, g_srfsh, g_synch1, g_synch2, g_syncv;
 std::uint64_t g_dispfb[2], g_display[2], g_extbuf, g_extdata, g_extwrite, g_bgcolor;
@@ -59,10 +70,6 @@ struct Transfer {
     std::uint32_t x = 0, y = 0;
     std::uint32_t pending_bits = 0, pending = 0;
 } g_transfer;
-
-std::uint32_t g_off32[32][64], g_offz32[32][64];
-std::uint32_t g_off16[64][64], g_off16s[64][64], g_offz16[64][64], g_offz16s[64][64];
-std::uint32_t g_off8[64][128], g_off4[128][128];
 
 const int kBlock32[4][8] = {{0, 1, 4, 5, 16, 17, 20, 21}, {2, 3, 6, 7, 18, 19, 22, 23}, {8, 9, 12, 13, 24, 25, 28, 29}, {10, 11, 14, 15, 26, 27, 30, 31}};
 const int kBlockZ32[4][8] = {{24, 25, 28, 29, 8, 9, 12, 13}, {26, 27, 30, 31, 10, 11, 14, 15}, {16, 17, 20, 21, 0, 1, 4, 5}, {18, 19, 22, 23, 2, 3, 6, 7}};
@@ -113,23 +120,6 @@ void build_tables() {
             table ^= static_cast<std::uint32_t>(column & 1);
             g_off4[y][x] = static_cast<std::uint32_t>((column * 64 + block * 256 + kColumnWord[table][wy & 1][wx & 7] * 4) * 2) + nibble;
         }
-}
-
-std::uint32_t wrap(std::uint32_t a) { return a & (kMemorySize - 1); }
-
-template <typename T>
-T get(std::uint32_t a) {
-    T v;
-    std::memcpy(&v, g_memory + wrap(a), sizeof v);
-    return v;
-}
-
-template <typename T>
-void put(std::uint32_t a, T v) { std::memcpy(g_memory + wrap(a), &v, sizeof v); }
-
-std::uint32_t page_address(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t pw, std::uint32_t ph) {
-    const std::uint32_t per_row = std::max<std::uint32_t>(1, bw * 64 / pw);
-    return bp * 256 + ((x / pw) + (y / ph) * per_row) * 8192;
 }
 
 void raise(std::uint32_t bit) {
@@ -188,6 +178,11 @@ void forget(const DownloadKey &key) {
 std::vector<std::pair<std::uint32_t, std::uint32_t>> g_seen_ranges;
 std::uint32_t g_transfer_serial = 0, g_stale_first = 0, g_stale_bytes = 0;
 bool g_transfer_stale = false;
+
+std::uint32_t page_address(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t pw, std::uint32_t ph) {
+    const std::uint32_t per_row = std::max<std::uint32_t>(1, bw * 64 / pw);
+    return bp * 256 + ((x / pw) + (y / ph) * per_row) * 8192;
+}
 
 void download_source(const State &s) {
     const std::uint32_t sbp = static_cast<std::uint32_t>(s.bitbltbuf) & 0x3FFFu, sbw = static_cast<std::uint32_t>(s.bitbltbuf >> 16) & 0x3Fu;
@@ -359,76 +354,15 @@ void swizzle_tables(std::vector<std::uint32_t> &out) {
 }
 
 std::uint32_t address32(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
-    return wrap(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]);
+    return wrap(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63]);
 }
 
 std::uint32_t read_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
-    switch (psm) {
-    case PSMCT32: return get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]);
-    case PSMCT24: return get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]) & 0xFFFFFFu;
-    case PSMZ32: return get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_offz32[y & 31][x & 63]);
-    case PSMZ24: return get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_offz32[y & 31][x & 63]) & 0xFFFFFFu;
-    case PSMCT16: return get<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_off16[y & 63][x & 63]);
-    case PSMCT16S: return get<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_off16s[y & 63][x & 63]);
-    case PSMZ16: return get<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_offz16[y & 63][x & 63]);
-    case PSMZ16S: return get<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_offz16s[y & 63][x & 63]);
-    case PSMT8: return get<std::uint8_t>(page_address(bp, bw, x, y, 128, 64) + g_off8[y & 63][x & 127]);
-    case PSMT4: {
-        const std::uint32_t n = g_off4[y & 127][x & 127];
-        const std::uint8_t b = get<std::uint8_t>(page_address(bp, bw, x, y, 128, 128) + n / 2);
-        return (n & 1u) ? b >> 4 : b & 15u;
-    }
-    case PSMT8H: return get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]) >> 24;
-    case PSMT4HL: return (get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]) >> 24) & 15u;
-    case PSMT4HH: return get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]) >> 28;
-    default: return get<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63]);
-    }
+    return pixel::read(psm, bp, bw, x, y);
 }
 
 void write_pixel(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t value) {
-    switch (psm) {
-    case PSMCT32: put<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63], value); break;
-    case PSMZ32: put<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_offz32[y & 31][x & 63], value); break;
-    case PSMCT24: {
-        const std::uint32_t a = page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0xFF000000u) | (value & 0xFFFFFFu));
-        break;
-    }
-    case PSMZ24: {
-        const std::uint32_t a = page_address(bp, bw, x, y, 64, 32) + g_offz32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0xFF000000u) | (value & 0xFFFFFFu));
-        break;
-    }
-    case PSMCT16: put<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_off16[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMCT16S: put<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_off16s[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMZ16: put<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_offz16[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMZ16S: put<std::uint16_t>(page_address(bp, bw, x, y, 64, 64) + g_offz16s[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMT8: put<std::uint8_t>(page_address(bp, bw, x, y, 128, 64) + g_off8[y & 63][x & 127], static_cast<std::uint8_t>(value)); break;
-    case PSMT4: {
-        const std::uint32_t n = g_off4[y & 127][x & 127];
-        const std::uint32_t a = page_address(bp, bw, x, y, 128, 128) + n / 2;
-        std::uint8_t b = get<std::uint8_t>(a);
-        b = (n & 1u) ? static_cast<std::uint8_t>((b & 0x0Fu) | ((value & 15u) << 4)) : static_cast<std::uint8_t>((b & 0xF0u) | (value & 15u));
-        put<std::uint8_t>(a, b);
-        break;
-    }
-    case PSMT8H: {
-        const std::uint32_t a = page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0x00FFFFFFu) | (value << 24));
-        break;
-    }
-    case PSMT4HL: {
-        const std::uint32_t a = page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0xF0FFFFFFu) | ((value & 15u) << 24));
-        break;
-    }
-    case PSMT4HH: {
-        const std::uint32_t a = page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0x0FFFFFFFu) | ((value & 15u) << 28));
-        break;
-    }
-    default: put<std::uint32_t>(page_address(bp, bw, x, y, 64, 32) + g_off32[y & 31][x & 63], value); break;
-    }
+    pixel::write(psm, bp, bw, x, y, value);
 }
 
 void init() {
