@@ -33,73 +33,67 @@ inline std::uint32_t page(std::uint32_t bp, std::uint32_t bw, std::uint32_t x, s
     return bp * 256 + ((x / Pw) + (y / Ph) * per_row) * 8192;
 }
 
-[[gnu::always_inline]] inline std::uint32_t read(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
+// Where a pixel lives: the byte offset (before wrapping), and for PSMT4 which nibble.
+struct Spot {
+    std::uint32_t at;
+    bool high;
+};
+
+[[gnu::always_inline]] inline Spot locate(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
     switch (psm) {
-    case PSMCT32: return get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63]);
-    case PSMCT24: return get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63]) & 0xFFFFFFu;
-    case PSMZ32: return get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_offz32[y & 31][x & 63]);
-    case PSMZ24: return get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_offz32[y & 31][x & 63]) & 0xFFFFFFu;
-    case PSMCT16: return get<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_off16[y & 63][x & 63]);
-    case PSMCT16S: return get<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_off16s[y & 63][x & 63]);
-    case PSMZ16: return get<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_offz16[y & 63][x & 63]);
-    case PSMZ16S: return get<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_offz16s[y & 63][x & 63]);
-    case PSMT8: return get<std::uint8_t>(page<128, 64>(bp, bw, x, y) + g_off8[y & 63][x & 127]);
+    case PSMZ32: case PSMZ24: return {page<64, 32>(bp, bw, x, y) + g_offz32[y & 31][x & 63], false};
+    case PSMCT16: return {page<64, 64>(bp, bw, x, y) + g_off16[y & 63][x & 63], false};
+    case PSMCT16S: return {page<64, 64>(bp, bw, x, y) + g_off16s[y & 63][x & 63], false};
+    case PSMZ16: return {page<64, 64>(bp, bw, x, y) + g_offz16[y & 63][x & 63], false};
+    case PSMZ16S: return {page<64, 64>(bp, bw, x, y) + g_offz16s[y & 63][x & 63], false};
+    case PSMT8: return {page<128, 64>(bp, bw, x, y) + g_off8[y & 63][x & 127], false};
     case PSMT4: {
         const std::uint32_t n = g_off4[y & 127][x & 127];
-        const std::uint8_t b = get<std::uint8_t>(page<128, 128>(bp, bw, x, y) + n / 2);
-        return (n & 1u) ? b >> 4 : b & 15u;
+        return {page<128, 128>(bp, bw, x, y) + n / 2, (n & 1u) != 0};
     }
-    case PSMT8H: return get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63]) >> 24;
-    case PSMT4HL: return (get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63]) >> 24) & 15u;
-    case PSMT4HH: return get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63]) >> 28;
-    default: return get<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63]);
+    default: return {page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63], false};  // PSMCT32/24, PSMT8H, PSMT4HL/HH
     }
 }
 
-[[gnu::always_inline]] inline void write(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t value) {
+[[gnu::always_inline]] inline std::uint32_t load(std::uint32_t psm, Spot s) {
     switch (psm) {
-    case PSMCT32: put<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63], value); break;
-    case PSMZ32: put<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_offz32[y & 31][x & 63], value); break;
-    case PSMCT24: {
-        const std::uint32_t a = page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0xFF000000u) | (value & 0xFFFFFFu));
-        break;
-    }
-    case PSMZ24: {
-        const std::uint32_t a = page<64, 32>(bp, bw, x, y) + g_offz32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0xFF000000u) | (value & 0xFFFFFFu));
-        break;
-    }
-    case PSMCT16: put<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_off16[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMCT16S: put<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_off16s[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMZ16: put<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_offz16[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMZ16S: put<std::uint16_t>(page<64, 64>(bp, bw, x, y) + g_offz16s[y & 63][x & 63], static_cast<std::uint16_t>(value)); break;
-    case PSMT8: put<std::uint8_t>(page<128, 64>(bp, bw, x, y) + g_off8[y & 63][x & 127], static_cast<std::uint8_t>(value)); break;
+    case PSMCT24: case PSMZ24: return get<std::uint32_t>(s.at) & 0xFFFFFFu;
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: return get<std::uint16_t>(s.at);
+    case PSMT8: return get<std::uint8_t>(s.at);
     case PSMT4: {
-        const std::uint32_t n = g_off4[y & 127][x & 127];
-        const std::uint32_t a = page<128, 128>(bp, bw, x, y) + n / 2;
-        std::uint8_t b = get<std::uint8_t>(a);
-        b = (n & 1u) ? static_cast<std::uint8_t>((b & 0x0Fu) | ((value & 15u) << 4)) : static_cast<std::uint8_t>((b & 0xF0u) | (value & 15u));
-        put<std::uint8_t>(a, b);
+        const std::uint8_t b = get<std::uint8_t>(s.at);
+        return s.high ? b >> 4 : b & 15u;
+    }
+    case PSMT8H: return get<std::uint32_t>(s.at) >> 24;
+    case PSMT4HL: return (get<std::uint32_t>(s.at) >> 24) & 15u;
+    case PSMT4HH: return get<std::uint32_t>(s.at) >> 28;
+    default: return get<std::uint32_t>(s.at);
+    }
+}
+
+[[gnu::always_inline]] inline void store(std::uint32_t psm, Spot s, std::uint32_t value) {
+    switch (psm) {
+    case PSMCT24: case PSMZ24: put<std::uint32_t>(s.at, (get<std::uint32_t>(s.at) & 0xFF000000u) | (value & 0xFFFFFFu)); break;
+    case PSMCT16: case PSMCT16S: case PSMZ16: case PSMZ16S: put<std::uint16_t>(s.at, static_cast<std::uint16_t>(value)); break;
+    case PSMT8: put<std::uint8_t>(s.at, static_cast<std::uint8_t>(value)); break;
+    case PSMT4: {
+        const std::uint8_t b = get<std::uint8_t>(s.at);
+        put<std::uint8_t>(s.at, s.high ? static_cast<std::uint8_t>((b & 0x0Fu) | ((value & 15u) << 4)) : static_cast<std::uint8_t>((b & 0xF0u) | (value & 15u)));
         break;
     }
-    case PSMT8H: {
-        const std::uint32_t a = page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0x00FFFFFFu) | (value << 24));
-        break;
+    case PSMT8H: put<std::uint32_t>(s.at, (get<std::uint32_t>(s.at) & 0x00FFFFFFu) | (value << 24)); break;
+    case PSMT4HL: put<std::uint32_t>(s.at, (get<std::uint32_t>(s.at) & 0xF0FFFFFFu) | ((value & 15u) << 24)); break;
+    case PSMT4HH: put<std::uint32_t>(s.at, (get<std::uint32_t>(s.at) & 0x0FFFFFFFu) | ((value & 15u) << 28)); break;
+    default: put<std::uint32_t>(s.at, value); break;
     }
-    case PSMT4HL: {
-        const std::uint32_t a = page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0xF0FFFFFFu) | ((value & 15u) << 24));
-        break;
-    }
-    case PSMT4HH: {
-        const std::uint32_t a = page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63];
-        put<std::uint32_t>(a, (get<std::uint32_t>(a) & 0x0FFFFFFFu) | ((value & 15u) << 28));
-        break;
-    }
-    default: put<std::uint32_t>(page<64, 32>(bp, bw, x, y) + g_off32[y & 31][x & 63], value); break;
-    }
+}
+
+[[gnu::always_inline]] inline std::uint32_t read(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y) {
+    return load(psm, locate(psm, bp, bw, x, y));
+}
+
+[[gnu::always_inline]] inline void write(std::uint32_t psm, std::uint32_t bp, std::uint32_t bw, std::uint32_t x, std::uint32_t y, std::uint32_t value) {
+    store(psm, locate(psm, bp, bw, x, y), value);
 }
 
 }

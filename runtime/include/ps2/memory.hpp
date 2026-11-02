@@ -17,8 +17,13 @@ extern std::uint8_t g_spr[];
 extern bool g_watch_on;
 extern std::uint32_t g_watch_base, g_watch_end;
 void watch_hit(std::uint32_t a, std::uint32_t v, const char *via);
-void watch_span(std::uint32_t a, std::uint32_t n, const char *via);
+void watch_span_hit(std::uint32_t a, std::uint32_t n, const char *via);
 void init_watch();
+
+// Bulk writers (DMA, SIF, file reads) report through this; the check stays inline so it costs nothing without PS2_WATCH.
+inline void watch_span(std::uint32_t a, std::uint32_t n, const char *via) {
+    if (g_watch_on) [[unlikely]] watch_span_hit(a, n, via);
+}
 
 template <typename T>
 inline bool watched(std::uint32_t a, std::uint32_t v) {

@@ -47,8 +47,7 @@ void watch_hit(std::uint32_t a, std::uint32_t v, const char *via) {
     std::fprintf(stderr, "[watch] write %08X = %08X (was %08X) via %s, pc 0x%08X ra 0x%08X\n", a, v, was, via, g_cpu.pc, g_cpu.r[31].w[0]);
 }
 
-void watch_span(std::uint32_t a, std::uint32_t n, const char *via) {
-    if (!g_watch_on) return;
+void watch_span_hit(std::uint32_t a, std::uint32_t n, const char *via) {
     const std::uint32_t s = a & (kRamSize - 1), e = s + n;
     if (e <= g_watch_base || s >= g_watch_end) return;
     for (std::uint32_t k = s & ~3u; k < e; k += 4) {

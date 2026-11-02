@@ -177,8 +177,10 @@ std::uint32_t sample(const Setup &s, float u, float v, float q) {
     return out;
 }
 
-std::uint32_t read_frame(const Setup &s, int x, int y) {
-    const std::uint32_t raw = pixel::read(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+[[gnu::always_inline]] inline pixel::Spot frame_spot(const Setup &s, int x, int y) { return pixel::locate(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)); }
+
+[[gnu::always_inline]] inline std::uint32_t read_frame(const Setup &s, pixel::Spot at) {
+    const std::uint32_t raw = pixel::load(s.fpsm, at);
     switch (s.fpsm) {
     case PSMCT24: return raw | 0x80000000u;
     case PSMCT16: case PSMCT16S:
@@ -187,29 +189,30 @@ std::uint32_t read_frame(const Setup &s, int x, int y) {
     }
 }
 
-void write_frame(const Setup &s, int x, int y, std::uint32_t c, std::uint32_t mask) {
+// PSMCT24 shares PSMCT32 storage, so the same spot serves its 32-bit read-modify-write.
+[[gnu::always_inline]] inline void write_frame(const Setup &s, pixel::Spot at, std::uint32_t c, std::uint32_t mask) {
     switch (s.fpsm) {
     case PSMCT16: case PSMCT16S: {
-        const std::uint32_t old = pixel::read(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+        const std::uint32_t old = pixel::load(s.fpsm, at);
         const auto pack = [](std::uint32_t v) {
             return ((v >> 3) & 0x1Fu) | (((v >> 11) & 0x1Fu) << 5) | (((v >> 19) & 0x1Fu) << 10) | ((v & 0x80000000u) ? 0x8000u : 0u);
         };
         const std::uint32_t m16 = pack(mask) | ((mask & 0x80000000u) ? 0x8000u : 0u);
-        pixel::write(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), (pack(c) & ~m16) | (old & m16));
+        pixel::store(s.fpsm, at, (pack(c) & ~m16) | (old & m16));
         break;
     }
     case PSMCT24: {
-        const std::uint32_t old = pixel::read(PSMCT32, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+        const std::uint32_t old = pixel::load(PSMCT32, at);
         const std::uint32_t m = mask | 0xFF000000u;
-        pixel::write(PSMCT32, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), (c & ~m) | (old & m));
+        pixel::store(PSMCT32, at, (c & ~m) | (old & m));
         break;
     }
     default: {
         if (mask) {
-            const std::uint32_t old = pixel::read(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+            const std::uint32_t old = pixel::load(s.fpsm, at);
             c = (c & ~mask) | (old & mask);
         }
-        pixel::write(s.fpsm, s.fbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), c);
+        pixel::store(s.fpsm, at, c);
         break;
     }
     }
@@ -284,7 +287,7 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
         const float tu = s.fst ? at.s / 16.0f : at.s / q * static_cast<float>(1 << s.tex.tw), tv = s.fst ? at.t / 16.0f : at.t / q * static_cast<float>(1 << s.tex.th);
         std::fprintf(stderr, "[pixel] frame %llu fbp %X fbw %u tme %d tbp %X tbw %u tpsm %X tw %u th %u wm %d/%d bil %d uv %.2f %.2f tfx %d -> rgba %d %d %d %d abe %d blend %d%d%d%d fix %u dst %08X z %u old %u zte %d ztst %d zmsk %d ate %d atst %d afail %d fbmsk %08X\n",
                      static_cast<unsigned long long>(frames_run()), s.fbp, s.fbw, s.tme, s.tex.tbp, s.tex.tbw, s.tex.tpsm, s.tex.tw, s.tex.th, s.tex.wms, s.tex.wmt, s.tex.bilinear ? 1 : 0, tu, tv, s.tfx,
-                     r, g, b, a, s.abe, s.a, s.b, s.c, s.d, s.fix, read_frame(s, x, y), z, old, s.zte, s.ztst, s.zmsk ? 1 : 0, s.ate, s.atst, s.afail, s.fbmsk);
+                     r, g, b, a, s.abe, s.a, s.b, s.c, s.d, s.fix, read_frame(s, frame_spot(s, x, y)), z, old, s.zte, s.ztst, s.zmsk ? 1 : 0, s.ate, s.atst, s.afail, s.fbmsk);
     }
     if (s.fge) {
         const int f = static_cast<int>(at.f);
@@ -318,18 +321,23 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
         }
     }
 
+    // Each buffer address is computed at most once and shared by the pixel's reads and writes.
+    pixel::Spot fb{};
     std::uint32_t dst = 0;
     bool have_dst = false;
     // PSMCT24 has no destination alpha bit; DATE is ignored for this format.
     if (s.date && s.fpsm != PSMCT24) {
-        dst = read_frame(s, x, y);
+        fb = frame_spot(s, x, y);
+        dst = read_frame(s, fb);
         have_dst = true;
         const bool bit = (dst & 0x80000000u) != 0;
         if (bit != s.datm) return;
     }
 
+    pixel::Spot zb{};
     if (s.zte) {
-        const std::uint32_t old = pixel::read(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y)) & zmax;
+        zb = pixel::locate(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y));
+        const std::uint32_t old = pixel::load(s.zpsm, zb) & zmax;
         bool pass;
         switch (s.ztst) {
         case 0: pass = false; break;
@@ -341,8 +349,9 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
     }
 
     if (write_fb) {
+        if (!have_dst) fb = frame_spot(s, x, y);
         if (s.abe && (!s.pabe || (a & 0x80))) {
-            if (!have_dst) dst = read_frame(s, x, y);
+            if (!have_dst) dst = read_frame(s, fb);
             const int cd[3] = {static_cast<int>(dst & 0xFFu), static_cast<int>((dst >> 8) & 0xFFu), static_cast<int>((dst >> 16) & 0xFFu)};
             const int cs[3] = {r, g, b};
             const int ad = static_cast<int>(dst >> 24);
@@ -374,15 +383,9 @@ void plot(const Setup &s, int x, int y, const Attr &at) {
         if (s.fba) out_a |= 0x80u;
         std::uint32_t mask = s.fbmsk;
         if (!write_alpha) mask |= 0xFF000000u;
-        write_frame(s, x, y, static_cast<std::uint32_t>(r) | (static_cast<std::uint32_t>(g) << 8) | (static_cast<std::uint32_t>(b) << 16) | (out_a << 24), mask);
+        write_frame(s, fb, static_cast<std::uint32_t>(r) | (static_cast<std::uint32_t>(g) << 8) | (static_cast<std::uint32_t>(b) << 16) | (out_a << 24), mask);
     }
-    if (write_z && s.zte) {
-        if (s.zpsm == PSMZ24) {
-            pixel::write(PSMZ24, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), z);
-        } else {
-            pixel::write(s.zpsm, s.zbp, s.fbw, static_cast<std::uint32_t>(x), static_cast<std::uint32_t>(y), z);
-        }
-    }
+    if (write_z && s.zte) pixel::store(s.zpsm, zb, z);
 }
 
 Setup make_setup(const State &st) {
